@@ -59,7 +59,7 @@ pub(crate) fn compile(source: &str, entry: &str, target: &str) -> windows::core:
     // for, and D3D12 refuses those bytes. A shader with no root signature of
     // its own (a vertex shader whose pixel shader carries it) keeps the
     // system's bytes: neither compiler has one to give.
-    if !source.contains("RootSignature") || carries_root_signature(&bytes) {
+    if !asks_for_root_signature(source, entry) || carries_root_signature(&bytes) {
         return Ok(bytes);
     }
     tracing::info!(
@@ -81,6 +81,46 @@ pub(crate) fn compile(source: &str, entry: &str, target: &str) -> windows::core:
 /// compilers store it as the chunk `RTS0`.
 fn carries_root_signature(bytes: &[u8]) -> bool {
     bytes.windows(4).any(|chunk| chunk == b"RTS0")
+}
+
+/// Whether the declaration of `entry` asks for a root signature. A source can
+/// hold several entries (a test compiles `corner`, which carries the
+/// signature, and `lit`, which does not), and only the entry's own attribute
+/// should send it to DXC. An attribute this cannot tie to a declaration counts
+/// as the entry's: the answer only decides whether a second compile is
+/// attempted, so it errs towards compiling again.
+fn asks_for_root_signature(source: &str, entry: &str) -> bool {
+    if !source.contains("RootSignature") {
+        return false;
+    }
+    let mut from = 0;
+    let mut found = false;
+    while let Some(at) = source[from..].find("[RootSignature") {
+        let at = from + at;
+        from = at + 1;
+        found = true;
+        // Skip this attribute and any others between it and the declaration.
+        let mut decl = &source[at..];
+        while let Some(attribute) = decl.trim_start().strip_prefix('[') {
+            let Some(close) = attribute.find(']') else {
+                return true;
+            };
+            decl = &attribute[close + 1..];
+        }
+        // The declared function's name is the word before its `(`.
+        let name = decl
+            .trim_start()
+            .split_once('(')
+            .and_then(|(head, _)| head.split_whitespace().last());
+        match name {
+            Some(name) if name == entry => return true,
+            Some(_) => {}
+            None => return true,
+        }
+    }
+    // A mention outside an attribute (`#define`) keeps the conservative
+    // answer.
+    !found
 }
 
 /// `D3DCompile`: the system's compiler, which on Windows compiles all of
@@ -352,6 +392,25 @@ void main() { b.Store(8, b.Load(0) + b.Load(4)); }
                 .expect("the shader must make a compute pipeline");
         }
         println!("D3D12 took the root signature and made the pipeline");
+    }
+
+    /// A source can hold several entries: only the entry carrying the
+    /// attribute asks for a root signature, so only it is retried with DXC.
+    #[test]
+    fn a_root_signature_belongs_to_the_entry_it_sits_on() {
+        const TWO: &str = r#"
+#define RS "UAV(u0)"
+[RootSignature(RS)]
+[numthreads(1, 1, 1)]
+void main() { }
+float4 lit() : SV_Target { return 1.0; }
+"#;
+        assert!(asks_for_root_signature(TWO, "main"));
+        assert!(!asks_for_root_signature(TWO, "lit"));
+        assert!(!asks_for_root_signature(
+            "float4 lit() : SV_Target { return 1.0; }",
+            "lit"
+        ));
     }
 
     /// A shader with no root signature of its own keeps the system's bytes:
