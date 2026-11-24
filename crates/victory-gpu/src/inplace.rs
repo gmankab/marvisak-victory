@@ -477,9 +477,8 @@ pub(crate) fn write_own(at: usize, bytes: &[u8]) -> Option<Vec<usize>> {
     if bytes.is_empty() || at / K64 != (at + bytes.len() - 1) / K64 {
         return None;
     }
-    // No mapping changes until the bytes are in: the view found below
-    // shows these pages for as long as this is held.
-    let _still = crate::watch::title_memory_reading_now()?;
+    // Keep the view and every alias stable until the bytes are in.
+    let _still = crate::watch::title_memory_reading_now(0, usize::MAX)?;
     let (section, offset, shown, section_bytes) = {
         let v = views();
         let (&base, &(len, section, offset)) = v.views.range(..=at).next_back()?;
