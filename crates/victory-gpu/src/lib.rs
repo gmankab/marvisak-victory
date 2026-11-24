@@ -52,6 +52,8 @@ mod heap_worker;
 #[cfg(windows)]
 mod host;
 #[cfg(windows)]
+mod over;
+#[cfg(windows)]
 mod indirect;
 #[cfg(windows)]
 mod inplace;
