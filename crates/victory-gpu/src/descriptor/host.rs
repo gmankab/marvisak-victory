@@ -997,6 +997,11 @@ const UNCAPPED_VIEWS: u32 = 1 << 21;
 pub(crate) fn probe_view_limit() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
+        if victory_shader::emit::portable_heap() {
+            tracing::info!("view heap capped at {PORTABLE_VIEWS} on every GPU (VICTORY_PORTABLE_HEAP=0: off)");
+            victory_shader::emit::set_view_heap_limit(PORTABLE_VIEWS - 1);
+            return;
+        }
         let Some(host) = host() else { return };
         let fits = |count: u32| {
             // SAFETY: plain heap creation; the heap is released at once.

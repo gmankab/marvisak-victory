@@ -130,6 +130,19 @@ pub fn view_heap_limit() -> u32 {
     VIEW_LIMIT.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// The host view heap is capped at 1 000 000 views on every GPU, as NVIDIA's
+/// driver caps it, so a view index past it reads the null slot (`VIEW_LIMIT`).
+/// AMD's driver takes the title's whole heap instead, and nothing then bounds
+/// an index: on an RX 7800 XT (driver 26.11.2) a read of view slot 2^23, far
+/// past the heap's end, page-faulted the card early in the opening cutscene
+/// (DRED: "view heap ...: 0xd200000 past its end (slot 8388608)"). With the cap
+/// it plays through to the prologue like the NVIDIA runs. `VICTORY_PORTABLE_HEAP=0`
+/// allows the larger heap on supported hosts. The shader cache keys on the limit.
+pub fn portable_heap() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_PORTABLE_HEAP").map_or(true, |v| v.trim() != "0"))
+}
+
 pub(crate) struct Shader {
     pub m: Module,
     pub t: Types,
