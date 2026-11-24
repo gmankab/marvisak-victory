@@ -5,6 +5,8 @@
 
 mod census;
 mod inspect;
+#[cfg(windows)]
+mod precompile;
 mod run;
 mod shader;
 mod translate;
@@ -92,6 +94,18 @@ enum Command {
         #[arg(long)]
         warm: Option<PathBuf>,
     },
+    /// Translate shader containers into the same disk cache that `run` uses.
+    #[cfg(windows)]
+    Precompile {
+        #[arg(required = true)]
+        files: Vec<PathBuf>,
+        /// Worker threads.
+        #[arg(long, default_value_t = 4, value_parser = clap::value_parser!(u16).range(1..=64))]
+        jobs: u16,
+        /// Stop after this many records, for a short cache check.
+        #[arg(long)]
+        limit: Option<usize>,
+    },
     /// Prepare, map and bind a title executable; with --execute, run it.
     Run {
         exe: PathBuf,
@@ -173,6 +187,13 @@ fn main() -> Result<()> {
                 return translate::warm(paths, &file, jobs);
             }
             translate::run(paths, validate, pipelines, list, jobs)
+        }
+        #[cfg(windows)]
+        Command::Precompile { files, jobs, limit } => {
+            if victory_shader::emit::portable_heap() {
+                victory_shader::emit::set_view_heap_limit(999_999);
+            }
+            precompile::run(&files, usize::from(jobs), limit)
         }
         Command::Run {
             exe,
