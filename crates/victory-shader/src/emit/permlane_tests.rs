@@ -140,6 +140,63 @@ fn permlane_fetch_inactive_outside_the_host_branch_is_rejected() {
 }
 
 #[test]
+fn permlane_fetch_inactive_after_reconvergence_is_allowed() {
+    let mut native = native(true, true, false, false, false);
+    let mut words: Vec<u32> = native
+        .code
+        .chunks_exact(4)
+        .map(|w| u32::from_le_bytes(w.try_into().unwrap()))
+        .collect();
+    // The branch only skips a scalar nop; every host lane meets at the shuffle.
+    words.splice(8..8, [0xBF88_0001, 0xBF80_0000]);
+    native.code = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+    lowered(&native, 32).expect("fetch-inactive after the lanes reconverge");
+}
+
+#[test]
+fn permlane_fetch_inactive_inside_a_uniform_branch_is_allowed() {
+    let mut native = native(true, true, false, false, false);
+    let mut words: Vec<u32> = native
+        .code
+        .chunks_exact(4)
+        .map(|w| u32::from_le_bytes(w.try_into().unwrap()))
+        .collect();
+    words.splice(8..8, [0xBF06_8000, 0xBF85_0002]); // scalar compare; skip shuffle on SCC
+    native.code = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+    lowered(&native, 32).expect("all host lanes take the scalar branch together");
+}
+
+#[test]
+fn permlane_fetch_inactive_after_a_lane_abort_is_rejected() {
+    let mut native = native(true, true, false, false, false);
+    let mut words: Vec<u32> = native
+        .code
+        .chunks_exact(4)
+        .map(|w| u32::from_le_bytes(w.try_into().unwrap()))
+        .collect();
+    // A lane-dependent header test with an unconditional back edge. The
+    // emitter's iteration limit returns the looping lanes from the shader;
+    // they never meet the lanes which reached the shuffle normally.
+    words.splice(
+        8..8,
+        [
+            0x7D88_0003, // v_cmp_gt_u32 vcc, s3, v0
+            0xBF86_0002, // s_cbranch_vccz -> shuffle
+            0xBF80_0000, // s_nop 0
+            0xBF82_FFFC, // s_branch -> compare
+        ],
+    );
+    native.code = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+    assert!(matches!(
+        lowered(&native, 32),
+        Err(ShaderError::Unsupported {
+            what: "a permlane fetch from lanes outside the host branch",
+            ..
+        })
+    ));
+}
+
+#[test]
 fn permlane_rows_and_inactive_sources() {
     let _one = super::valu_tests::ONE_AT_A_TIME
         .lock()
