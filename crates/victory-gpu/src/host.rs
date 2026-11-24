@@ -252,6 +252,9 @@ fn create() -> windows::core::Result<Host> {
         if std::env::var_os("VICTORY_DXCOMPILER").is_some() {
             let _ = crate::indirect::compiled();
         }
+        let wave64_mode = recommended_wave64_mode(&device);
+        crate::shader_cache::set_wave64_mode(wave64_mode);
+        tracing::info!(?wave64_mode, "Wave64 compute lowering mode selected");
         Ok(Host {
             device,
             queue,
@@ -268,6 +271,31 @@ fn create() -> windows::core::Result<Host> {
             indirect_zero: OnceLock::new(),
             presenter: Mutex::new(None),
         })
+    }
+}
+
+/// Queries D3D12 wave lane capabilities and chooses the Wave64 lowering mode.
+fn recommended_wave64_mode(device: &ID3D12Device) -> victory_shader::emit::Wave64Mode {
+    use victory_shader::emit::Wave64Mode;
+    let mut opts = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
+    // SAFETY: plain D3D12 feature query with valid struct size.
+    let ok = unsafe {
+        device.CheckFeatureSupport(
+            D3D12_FEATURE_D3D12_OPTIONS1,
+            (&raw mut opts).cast(),
+            size_of_val(&opts) as u32,
+        )
+    }
+    .is_ok();
+    if !ok || !opts.WaveOps.as_bool() {
+        return Wave64Mode::Emulate;
+    }
+    if opts.WaveLaneCountMin <= 64 && opts.WaveLaneCountMax >= 64 {
+        Wave64Mode::Native
+    } else if opts.WaveLaneCountMin <= 32 && opts.WaveLaneCountMax >= 32 {
+        Wave64Mode::Wave32
+    } else {
+        Wave64Mode::Emulate
     }
 }
 
