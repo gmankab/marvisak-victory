@@ -9,10 +9,14 @@
 //! outright (`E5005: Method 'Load' is not defined on type
 //! 'RWByteAddressBuffer'`), and every caller then gives up: no argument
 //! clamp, so indirect executions are dropped; no card compare, so card
-//! buffers silently switch off; no twins. So when it refuses, the same
-//! source is compiled with DXC (`dxcompiler.dll`) as shader model 6.0
-//! instead. The root signature stays inside the shader, so the callers see
-//! only bytes, and on Windows, where `D3DCompile` succeeds, nothing changes.
+//! buffers silently switch off; no twins. It also compiles the rest of the
+//! source but drops the root signature the shader asks for, so
+//! `CreateRootSignature` over its bytes fails and the twins still have no
+//! pipeline. So the same source is compiled with DXC (`dxcompiler.dll`) as
+//! shader model 6.0 when the system compiler refuses it, or leaves the root
+//! signature out of a shader that asked for one. The root signature stays
+//! inside the shader, so the callers see only bytes, and on Windows, where
+//! `D3DCompile` succeeds and keeps the root signature, nothing changes.
 //!
 //! DXC is looked for in `VICTORY_DXC` (the DLL or its folder), beside the
 //! `dxil.dll` that shader validation uses (the Windows SDK ships the two
@@ -35,10 +39,11 @@ use windows::Win32::System::LibraryLoader::{
 use windows::core::{GUID, HSTRING, Interface, PCWSTR, s, w};
 
 /// Compiles function `entry` of `source` for `target` (e.g. `cs_5_1`), with
-/// the system's compiler or, if it refuses, with DXC (see the module docs).
+/// the system's compiler or, if it refuses or leaves the root signature out,
+/// with DXC (see the module docs).
 pub(crate) fn compile(source: &str, entry: &str, target: &str) -> windows::core::Result<Vec<u8>> {
-    match system(source, entry, target) {
-        Ok(bytes) => Ok(bytes),
+    let bytes = match system(source, entry, target) {
+        Ok(bytes) => bytes,
         Err(e) => {
             tracing::info!(
                 error = %e,
@@ -46,10 +51,36 @@ pub(crate) fn compile(source: &str, entry: &str, target: &str) -> windows::core:
                 target,
                 "the system compiler refused one of our shaders: trying DXC"
             );
-            dxc(source, entry, target)
-                .inspect_err(|e| tracing::warn!(error = %e, entry, target, "DXC failed too"))
+            return dxc(source, entry, target)
+                .inspect_err(|e| tracing::warn!(error = %e, entry, target, "DXC failed too"));
+        }
+    };
+    // Wine's compiler takes the source but drops the root signature it asks
+    // for, and D3D12 refuses those bytes. A shader with no root signature of
+    // its own (a vertex shader whose pixel shader carries it) keeps the
+    // system's bytes: neither compiler has one to give.
+    if !source.contains("RootSignature") || carries_root_signature(&bytes) {
+        return Ok(bytes);
+    }
+    tracing::info!(
+        entry,
+        target,
+        "the system compiler left the root signature out of one of our shaders: trying DXC"
+    );
+    match dxc(source, entry, target) {
+        Ok(with_signature) if carries_root_signature(&with_signature) => Ok(with_signature),
+        Ok(_) => Ok(bytes),
+        Err(e) => {
+            tracing::warn!(error = %e, entry, target, "DXC failed too");
+            Ok(bytes)
         }
     }
+}
+
+/// Whether the container holds the root signature the shader asked for: both
+/// compilers store it as the chunk `RTS0`.
+fn carries_root_signature(bytes: &[u8]) -> bool {
+    bytes.windows(4).any(|chunk| chunk == b"RTS0")
 }
 
 /// `D3DCompile`: the system's compiler, which on Windows compiles all of
@@ -249,4 +280,98 @@ fn sign(compiler: HMODULE, bytes: &mut [u8]) -> windows::core::Result<()> {
 /// A NUL-terminated UTF-16 copy of `text`, for DXC's arguments.
 fn wide(text: &str) -> Vec<u16> {
     text.encode_utf16().chain([0]).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    //! The fallback, and the bytes it makes: under Wine the system compiler
+    //! refuses this source and DXC compiles it; on Windows `D3DCompile`
+    //! compiles it, and either way D3D12 must take what comes out.
+
+    use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
+    use windows::Win32::Graphics::Direct3D12::{
+        D3D12_COMPUTE_PIPELINE_STATE_DESC, D3D12_SHADER_BYTECODE, D3D12CreateDevice, ID3D12Device,
+        ID3D12PipelineState, ID3D12RootSignature,
+    };
+
+    use super::*;
+
+    /// A shader that loads through an `RWByteAddressBuffer` (vkd3d-shader
+    /// refuses the `Load`) and asks for a root signature (which vkd3d-shader
+    /// would drop): the shape the in-place probe has.
+    const SOURCE: &str = r#"
+#define RS "UAV(u0)"
+RWByteAddressBuffer b : register(u0);
+[RootSignature(RS)]
+[numthreads(1, 1, 1)]
+void main() { b.Store(8, b.Load(0) + b.Load(4)); }
+"#;
+
+    #[test]
+    fn a_shader_the_system_compiler_refuses_is_compiled_by_dxc() {
+        match system(SOURCE, "main", "cs_5_1") {
+            Ok(_) => println!("the system compiler compiled it: DXC is not exercised here"),
+            Err(e) => println!("the system compiler refused it: {e}"),
+        }
+        let bytes = compile(SOURCE, "main", "cs_5_1").expect("a compiler must take the shader");
+        let magic = std::str::from_utf8(&bytes[..4]).unwrap_or("?");
+        println!("container {magic}, {} bytes", bytes.len());
+        assert!(
+            matches!(magic, "DXIL" | "DXBC"),
+            "not a shader container: {magic}"
+        );
+        assert!(
+            bytes[4..20].iter().any(|&b| b != 0),
+            "the container carries no digest: D3D12 would refuse it"
+        );
+        assert!(
+            carries_root_signature(&bytes),
+            "the container carries no root signature, which the shader asks for"
+        );
+        let Some(device) = device() else {
+            println!("no D3D12 device here: the root signature and pipeline are not checked");
+            return;
+        };
+        // SAFETY: the root signature is inside the shader; the description
+        // points at live bytes and never releases its pointer.
+        unsafe {
+            let root: ID3D12RootSignature = device
+                .CreateRootSignature(0, &bytes)
+                .expect("D3D12 must take the root signature inside the shader");
+            device
+                .CreateComputePipelineState::<ID3D12PipelineState>(
+                    &D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                        pRootSignature: std::mem::transmute_copy(&root),
+                        CS: D3D12_SHADER_BYTECODE {
+                            pShaderBytecode: bytes.as_ptr().cast(),
+                            BytecodeLength: bytes.len(),
+                        },
+                        ..Default::default()
+                    },
+                )
+                .expect("the shader must make a compute pipeline");
+        }
+        println!("D3D12 took the root signature and made the pipeline");
+    }
+
+    /// A shader with no root signature of its own keeps the system's bytes:
+    /// its root signature comes from another stage.
+    #[test]
+    fn a_shader_that_asks_for_no_root_signature_compiles() {
+        const CORNERS: &str = r#"
+float4 corner(uint i : SV_VertexID) : SV_Position {
+    return float4(float(i & 1) * 4.0 - 1.0, float(i >> 1) * 4.0 - 1.0, 0.0, 1.0);
+}
+"#;
+        let bytes = compile(CORNERS, "corner", "vs_5_1").expect("a compiler must take the shader");
+        assert!(!carries_root_signature(&bytes));
+    }
+
+    /// A D3D12 device (the default adapter; WARP counts), if there is one.
+    fn device() -> Option<ID3D12Device> {
+        let mut device: Option<ID3D12Device> = None;
+        // SAFETY: the out pointer is ours.
+        unsafe { D3D12CreateDevice(None, D3D_FEATURE_LEVEL_11_0, &mut device).ok()? };
+        device
+    }
 }
