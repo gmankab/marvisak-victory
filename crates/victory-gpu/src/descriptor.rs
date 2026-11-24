@@ -415,13 +415,17 @@ fn words<const N: usize>(desc: *const [u32; N]) -> Option<[u32; N]> {
 pub(crate) extern "win64" fn create_cbv(_: This, desc: *const [u32; 4], handle: u64) {
     use windows::Win32::Graphics::Direct3D12::D3D12_REQ_CONSTANT_BUFFER_ELEMENT_COUNT;
 
-    if let Some([lo, hi, size, _]) = words(desc) {
-        let address = u64::from(lo) | u64::from(hi) << 32;
-        // A host constant view can address 4,096 16-byte registers. Bound the
-        // range before it is copied to scratch or rounded up for the host.
-        let size = size.min(D3D12_REQ_CONSTANT_BUFFER_ELEMENT_COUNT * 16);
-        record(handle, View::Constant(address, size));
-    }
+    let view = match words(desc) {
+        Some([lo, hi, size, _]) => {
+            let address = u64::from(lo) | u64::from(hi) << 32;
+            // A host constant view can address 4,096 16-byte registers. Bound the
+            // range before it is copied to scratch or rounded up for the host.
+            let size = size.min(D3D12_REQ_CONSTANT_BUFFER_ELEMENT_COUNT * 16);
+            View::Constant(address, size)
+        }
+        None => View::Constant(0, 0),
+    };
+    record(handle, view);
 }
 
 /// Device method.
@@ -702,6 +706,17 @@ mod tests {
             create_cbv(std::ptr::null(), &[0x1000, 1, size, 0], handle);
             assert_eq!(view(handle), Some(View::Constant(0x1_0000_1000, expected)));
         }
+    }
+
+    #[test]
+    fn null_cbv_overwrites_previous_descriptor() {
+        let null = std::ptr::null();
+        let mut slot = [0u64; 4];
+        let handle = slot.as_mut_ptr() as u64;
+        create_cbv(null, &[0x1000, 0, 256, 0], handle);
+        assert_eq!(view(handle), Some(View::Constant(0x1000, 256)));
+        create_cbv(null, std::ptr::null(), handle);
+        assert_eq!(view(handle), Some(View::Constant(0, 0)));
     }
 
     #[test]
