@@ -630,6 +630,7 @@ Rendering:
 - Implicit-level samples outside pixel shaders produced invalid DXIL in 730 compute programs; fixed.
 - Rectangle lists, depth and stencil twins for depth textures written by compute, texture read-backs.
 - Ray tracing, in progress and off by default: the game's own structure-builder programs translate, title memory can be read by raw address from shaders, the hardware ray/box and ray/triangle test is emulated in DXIL (checked against a reference on the GPU), and 59 of the 64 trace programs translate. Nothing is lit by it yet. See [docs/fork-ray-tracing.md](docs/fork-ray-tracing.md).
+- The host's own HLSL (the indirect-argument clamp, the compare of copies in the card's memory, the depth-plane twins, the in-place probe) falls back to DXC when the system compiler refuses it: under Wine and Proton `d3dcompiler_47` is vkd3d-shader, which rejects `RWByteAddressBuffer` methods, and the clamp, card buffers and twins then all silently switched off. `dxcompiler.dll` is looked for in `VICTORY_DXC` (the DLL or its folder), beside the `dxil.dll` that shader validation uses, then the executable's folder and System32; on Windows, where `D3DCompile` succeeds, nothing changes.
 
 Speed and memory:
 - Waits for memory values, write-watch queries and page queries no longer walk page tables per call.
@@ -649,6 +650,7 @@ Each is described in a comment where it is read.
 ### Known problems
 
 - Everything in shadow is black (see above).
+- Under Wine and Proton the run-time HLSL compiles need DXC's `dxcompiler.dll` and `dxil.dll` (see the last rendering item above); Wine's built-in `d3dcompiler_47` cannot compile them.
 - The interior of the first gameplay room is sometimes not drawn after the cutscene hands over to gameplay.
 - Around 24 GB of memory is in use during play, about 16 GB of it in memory: the 32 GB test PC has about 1 to 5 GB free, and the 12 GB card is nearly full, so textures are let go and made again for lack of room.
 - A few style lints are switched off for this fork in the workspace `Cargo.toml` until the newer code is tidied.

@@ -4,9 +4,10 @@
 //! billion vertices or a dispatch past the host's limits runs until the
 //! host resets the display driver. So active records are copied and clamped
 //! on the GPU into a device-local scratch buffer, just before execution, by a
-//! compute shader of ours (HLSL compiled by the system's compiler; a 5.1
-//! shader with its root signature inside), leaving the title's argument and
-//! count buffers untouched.
+//! compute shader of ours (HLSL compiled at run time by the system's compiler
+//! or, under Wine and Proton, by DXC: [`crate::dxc`]; a 5.1 shader with its
+//! root signature inside), leaving the title's argument and count buffers
+//! untouched.
 //!
 //! The scratch buffer is left readable as indirect arguments after a clamp
 //! and stays so until the next clamp into it, which moves it straight back
@@ -29,11 +30,9 @@
 //! dispatches, the budget) cut legitimate work beyond them; raise them if
 //! the title needs more.
 
-use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
-use windows::Win32::Graphics::Direct3D::ID3DBlob;
 use windows::Win32::Graphics::Direct3D12::*;
-use windows::core::s;
 
+use crate::dxc::compile;
 use crate::host::{HostList, host, transition};
 
 const SOURCE: &str = r#"
@@ -259,42 +258,15 @@ fn make_for(device: &ID3D12Device) -> windows::core::Result<Clamp> {
 /// The clamp compiled from `source` (ours, or in the benchmark the one it
 /// replaced).
 fn make_from(device: &ID3D12Device, source: &str) -> windows::core::Result<Clamp> {
-    let mut code: Option<ID3DBlob> = None;
-    let mut errors: Option<ID3DBlob> = None;
-    // SAFETY: the source and names live through the call; out pointers ours.
-    let compiled = unsafe {
-        D3DCompile(
-            source.as_ptr().cast(),
-            source.len(),
-            s!("clamp"),
-            None,
-            None,
-            s!("main"),
-            s!("cs_5_1"),
-            0,
-            0,
-            &mut code,
-            Some(&mut errors),
-        )
-    };
-    if let Err(e) = compiled {
-        if let Some(errors) = errors {
-            // SAFETY: the blob's own bytes.
-            let text = unsafe {
-                std::slice::from_raw_parts(
-                    errors.GetBufferPointer().cast::<u8>(),
-                    errors.GetBufferSize(),
-                )
-            };
-            tracing::warn!("argument clamp: {}", String::from_utf8_lossy(text));
-        }
-        return Err(e);
-    }
-    let code = code.ok_or_else(windows::core::Error::empty)?;
-    // SAFETY: the blob's own bytes; the root signature is inside the shader.
+    let bytes = compile(source, "main", "cs_5_1")?;
+    make_clamp(device, &bytes)
+}
+
+/// The clamp's root signature and pipeline over compiled `bytes`.
+fn make_clamp(device: &ID3D12Device, bytes: &[u8]) -> windows::core::Result<Clamp> {
+    // SAFETY: the root signature is inside the shader; the description
+    // points at live bytes and never releases its pointer.
     unsafe {
-        let bytes =
-            std::slice::from_raw_parts(code.GetBufferPointer().cast::<u8>(), code.GetBufferSize());
         let root: ID3D12RootSignature = device.CreateRootSignature(0, bytes)?;
         let pso = device.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
             pRootSignature: std::mem::transmute_copy(&root),
@@ -1182,38 +1154,7 @@ void main() {
     }
 
     fn compile_cs(device: &ID3D12Device, source: &str) -> windows::core::Result<Clamp> {
-        let mut code: Option<ID3DBlob> = None;
-        // SAFETY: source and entry names outlive `D3DCompile`.
-        unsafe {
-            D3DCompile(
-                source.as_ptr().cast(),
-                source.len(),
-                s!("worker"),
-                None,
-                None,
-                s!("main"),
-                s!("cs_5_1"),
-                0,
-                0,
-                &mut code,
-                None,
-            )?;
-            let code = code.unwrap();
-            let bytes = std::slice::from_raw_parts(
-                code.GetBufferPointer().cast::<u8>(),
-                code.GetBufferSize(),
-            );
-            let root: ID3D12RootSignature = device.CreateRootSignature(0, bytes)?;
-            let pso = device.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
-                pRootSignature: std::mem::transmute_copy(&root),
-                CS: D3D12_SHADER_BYTECODE {
-                    pShaderBytecode: bytes.as_ptr().cast(),
-                    BytecodeLength: bytes.len(),
-                },
-                ..Default::default()
-            })?;
-            Ok(Clamp { root, pso })
-        }
+        make_clamp(device, &compile(source, "main", "cs_5_1")?)
     }
 
     /// The compare of copies in the card's memory (`crate::host`), on the
@@ -2505,7 +2446,7 @@ mod bare_cost {
     use windows::Win32::Graphics::Dxgi::Common::*;
     use windows::Win32::Graphics::Dxgi::*;
     use windows::Win32::System::Threading::{CreateEventW, INFINITE, WaitForSingleObject};
-    use windows::core::{Interface, s};
+    use windows::core::Interface;
 
     use crate::host::{compile, transition};
 
@@ -2728,12 +2669,12 @@ void work() {
         /// The default adapter, as the layer takes it; `None` without one
         /// or on a software adapter.
         fn new() -> Option<Self> {
-            let vs = compile(DRAW, s!("corner"), s!("vs_5_1")).ok()?;
+            let vs = compile(DRAW, "corner", "vs_5_1").ok()?;
             let ps = [
-                compile(DRAW, s!("first"), s!("ps_5_1")).ok()?,
-                compile(DRAW, s!("second"), s!("ps_5_1")).ok()?,
+                compile(DRAW, "first", "ps_5_1").ok()?,
+                compile(DRAW, "second", "ps_5_1").ok()?,
             ];
-            let cs = compile(WORK, s!("work"), s!("cs_5_1")).ok()?;
+            let cs = compile(WORK, "work", "cs_5_1").ok()?;
             // SAFETY: plain object creation on a device of our own; the
             // views are made in heaps that live as long as the rig.
             unsafe {

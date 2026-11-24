@@ -1335,52 +1335,11 @@ fn plane_pass() -> Option<&'static PlanePass> {
     .as_ref()
 }
 
-/// Compiles function `entry` of `source` for `target` with the system's
-/// compiler, as the indirect-argument clamp is (`crate::indirect`).
-pub(crate) fn compile(
-    source: &str,
-    entry: windows::core::PCSTR,
-    target: windows::core::PCSTR,
-) -> windows::core::Result<Vec<u8>> {
-    use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
-    use windows::Win32::Graphics::Direct3D::ID3DBlob;
-    let mut code: Option<ID3DBlob> = None;
-    let mut errors: Option<ID3DBlob> = None;
-    // SAFETY: the source and names live through the call; out pointers ours.
-    let compiled = unsafe {
-        D3DCompile(
-            source.as_ptr().cast(),
-            source.len(),
-            windows::core::s!("victory"),
-            None,
-            None,
-            entry,
-            target,
-            0,
-            0,
-            &mut code,
-            Some(&mut errors),
-        )
-    };
-    if let Err(e) = compiled {
-        if let Some(errors) = errors {
-            // SAFETY: the blob's own bytes.
-            let text = unsafe {
-                std::slice::from_raw_parts(
-                    errors.GetBufferPointer().cast::<u8>(),
-                    errors.GetBufferSize(),
-                )
-            };
-            tracing::warn!("a shader of ours: {}", String::from_utf8_lossy(text));
-        }
-        return Err(e);
-    }
-    let code = code.ok_or_else(windows::core::Error::empty)?;
-    // SAFETY: the blob's own bytes.
-    let bytes = unsafe {
-        std::slice::from_raw_parts(code.GetBufferPointer().cast::<u8>(), code.GetBufferSize())
-    };
-    Ok(bytes.to_vec())
+/// Compiles function `entry` of `source` for `target`, as the indirect-argument
+/// clamp is (`crate::indirect`): with the system's compiler or, under Wine and
+/// Proton, with DXC (`crate::dxc`).
+pub(crate) fn compile(source: &str, entry: &str, target: &str) -> windows::core::Result<Vec<u8>> {
+    crate::dxc::compile(source, entry, target)
 }
 
 impl PlanePass {
@@ -1408,11 +1367,10 @@ impl PlanePass {
     }
 
     fn make(steps: bool, format: DXGI_FORMAT) -> windows::core::Result<PlanePipeline> {
-        use windows::core::s;
         let device = &host().ok_or_else(windows::core::Error::empty)?.device;
-        let vs = compile(PLANE_CORNERS, s!("corner"), s!("vs_5_1"))?;
+        let vs = compile(PLANE_CORNERS, "corner", "vs_5_1")?;
         let source = if steps { PLANE_STEPS } else { PLANE_FLOATS };
-        let ps = compile(source, s!("plane"), s!("ps_5_1"))?;
+        let ps = compile(source, "plane", "ps_5_1")?;
         let code = |bytes: &[u8]| D3D12_SHADER_BYTECODE {
             pShaderBytecode: bytes.as_ptr().cast(),
             BytecodeLength: bytes.len(),
@@ -4684,39 +4642,17 @@ impl Host {
     }
 
     fn make_card_work(&self) -> windows::core::Result<CardWork> {
-        use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
-        use windows::Win32::Graphics::Direct3D::ID3DBlob;
-        let mut code: Option<ID3DBlob> = None;
-        // SAFETY: the source and names live through the call; the out
-        // pointer is ours.
-        unsafe {
-            let source = card_compare_source();
-            D3DCompile(
-                source.as_ptr().cast(),
-                source.len(),
-                windows::core::s!("card compare"),
-                None,
-                None,
-                windows::core::s!("main"),
-                windows::core::s!("cs_5_1"),
-                0,
-                0,
-                &mut code,
-                None,
-            )?;
-        }
-        let code = code.ok_or_else(windows::core::Error::empty)?;
+        let bytes = crate::dxc::compile(card_compare_source(), "main", "cs_5_1")?;
         let list = || self.make_prelude().ok_or_else(windows::core::Error::empty);
         // A megabyte of results: 262,144 pieces, 16 GB of declared ranges
         // in one submission.
         const RESULTS: u64 = 1 << 20;
         let (differs, data) = self.shared_buffer(RESULTS).ok_or_else(windows::core::Error::empty)?;
         name(&differs, || "card compare results".into());
-        // SAFETY: the blob's own bytes; the root signature is inside the
-        // shader.
+        // SAFETY: the root signature is inside the shader; the description
+        // points at live bytes and never releases its pointer.
         unsafe {
-            let bytes = std::slice::from_raw_parts(code.GetBufferPointer().cast::<u8>(), code.GetBufferSize());
-            let root: ID3D12RootSignature = self.device.CreateRootSignature(0, bytes)?;
+            let root: ID3D12RootSignature = self.device.CreateRootSignature(0, &bytes)?;
             let pso: ID3D12PipelineState = self.device.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
                 pRootSignature: std::mem::transmute_copy(&root),
                 CS: D3D12_SHADER_BYTECODE {
@@ -10092,7 +10028,7 @@ void main() {
             eprintln!("queue2_tests: skipped, the copy is not in the card's memory (VICTORY_CARD_BUFFERS_MIN_MB=1)");
             return;
         }
-        let code = compile(ADD, windows::core::s!("main"), windows::core::s!("cs_5_1")).expect("the test's shader");
+        let code = compile(ADD, "main", "cs_5_1").expect("the test's shader");
         // SAFETY: the shader's own root signature; plain creation.
         let (root, pso): (ID3D12RootSignature, ID3D12PipelineState) = unsafe {
             let root: ID3D12RootSignature = host.device.CreateRootSignature(0, &code).expect("a root signature");
@@ -10254,7 +10190,7 @@ void main() {
             eprintln!("queue2_tests: skipped, the copy is not in the card's memory (VICTORY_CARD_BUFFERS_MIN_MB=1)");
             return;
         }
-        let code = compile(TWICE, windows::core::s!("main"), windows::core::s!("cs_5_1")).expect("the test's shader");
+        let code = compile(TWICE, "main", "cs_5_1").expect("the test's shader");
         // SAFETY: the shader's own root signature; plain creation.
         let (root, pso): (ID3D12RootSignature, ID3D12PipelineState) = unsafe {
             let root: ID3D12RootSignature = host.device.CreateRootSignature(0, &code).expect("a root signature");
