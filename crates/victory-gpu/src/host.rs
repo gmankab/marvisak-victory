@@ -1264,17 +1264,13 @@ float4 corner(uint i : SV_VertexID) : SV_Position {
 }
 "#;
 const PLANE_STEPS: &str = r#"
-#define RS "DescriptorTable(SRV(t0), visibility = SHADER_VISIBILITY_PIXEL)"
 Texture2DArray<uint> twin : register(t0);
-[RootSignature(RS)]
 float plane(float4 p : SV_Position) : SV_Depth {
     return float(twin.Load(int4(int2(p.xy), 0, 0))) * asfloat(0x37800080);
 }
 "#;
 const PLANE_FLOATS: &str = r#"
-#define RS "DescriptorTable(SRV(t0), visibility = SHADER_VISIBILITY_PIXEL)"
 Texture2DArray<float> twin : register(t0);
-[RootSignature(RS)]
 float plane(float4 p : SV_Position) : SV_Depth {
     return twin.Load(int4(int2(p.xy), 0, 0));
 }
@@ -1342,6 +1338,30 @@ pub(crate) fn compile(source: &str, entry: &str, target: &str) -> windows::core:
     crate::dxc::compile(source, entry, target)
 }
 
+/// Creates a root signature independently of the shader compiler.
+///
+/// # Safety
+/// Any pointers in `params` must remain valid through serialization.
+pub(crate) unsafe fn root_signature_from_params(
+    device: &ID3D12Device,
+    params: &[D3D12_ROOT_PARAMETER],
+) -> windows::core::Result<ID3D12RootSignature> {
+    let desc = D3D12_ROOT_SIGNATURE_DESC {
+        NumParameters: params.len() as u32,
+        pParameters: params.as_ptr(),
+        ..Default::default()
+    };
+    // SAFETY: `params` and the data it references live through serialization.
+    unsafe {
+        let mut blob = None;
+        D3D12SerializeRootSignature(&desc, D3D_ROOT_SIGNATURE_VERSION_1, &mut blob, None)?;
+        let blob = blob.ok_or_else(windows::core::Error::empty)?;
+        let bytes =
+            std::slice::from_raw_parts(blob.GetBufferPointer().cast::<u8>(), blob.GetBufferSize());
+        device.CreateRootSignature(0, bytes)
+    }
+}
+
 impl PlanePass {
     /// The root signature and pipeline for a twin of 16-bit steps (`steps`)
     /// or of floats and the depth format `format`.
@@ -1375,10 +1395,25 @@ impl PlanePass {
             pShaderBytecode: bytes.as_ptr().cast(),
             BytecodeLength: bytes.len(),
         };
-        // SAFETY: the root signature is inside the pixel shader; the
-        // description points at live data and never releases its pointer.
+        let range = D3D12_DESCRIPTOR_RANGE {
+            RangeType: D3D12_DESCRIPTOR_RANGE_TYPE_SRV,
+            NumDescriptors: 1,
+            OffsetInDescriptorsFromTableStart: D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND,
+            ..Default::default()
+        };
+        let param = D3D12_ROOT_PARAMETER {
+            ParameterType: D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE,
+            Anonymous: D3D12_ROOT_PARAMETER_0 {
+                DescriptorTable: D3D12_ROOT_DESCRIPTOR_TABLE {
+                    NumDescriptorRanges: 1,
+                    pDescriptorRanges: &range,
+                },
+            },
+            ShaderVisibility: D3D12_SHADER_VISIBILITY_PIXEL,
+        };
+        // SAFETY: `range` and the pipeline description's references are live.
         unsafe {
-            let root: ID3D12RootSignature = device.CreateRootSignature(0, &ps[..])?;
+            let root = root_signature_from_params(device, &[param])?;
             let desc = D3D12_GRAPHICS_PIPELINE_STATE_DESC {
                 pRootSignature: std::mem::transmute_copy(&root),
                 VS: code(&vs[..]),
