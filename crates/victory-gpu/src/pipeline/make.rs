@@ -169,6 +169,7 @@ fn queue(p: Arc<Pending>) {
             let receiver = receiver.clone();
             let spawned = std::thread::Builder::new()
                 .name(format!("victory-pipelines-{i}"))
+                .stack_size(victory_shader::emit::PIPELINE_STACK)
                 .spawn(move || {
                     // Below the title's own threads (loading, recording).
                     // SAFETY: a plain call on our own thread.
