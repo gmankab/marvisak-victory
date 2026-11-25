@@ -1021,7 +1021,6 @@ impl State {
             _ => false,
         };
         if !ran {
-            crate::indirect::done(list, &clamped);
             #[cfg(feature = "diagnostics")]
             match crate::pipeline::host_pipeline(self.pipeline as This) {
                 None => crate::pipeline::note_drop(self.pipeline as This),
@@ -1045,7 +1044,6 @@ impl State {
                 0,
             )
         };
-        crate::indirect::done(list, &clamped);
         if kind == DISPATCH {
             DISPATCHED.fetch_add(1, Ordering::Relaxed);
         } else {

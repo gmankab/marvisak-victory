@@ -339,7 +339,7 @@ pub(crate) struct HostList {
     /// The work its indirect executions may still do (`indirect`): a
     /// shader-writable word, zeroed when the list is submitted.
     budget: OnceLock<Option<(ID3D12Resource, usize)>>,
-    arguments: Mutex<Option<ID3D12Resource>>,
+    arguments: Mutex<Option<ArgumentBuffer>>,
     /// The texts of the markers `note_op` set, in order (for device-removed
     /// data without marker texts), with the host GPU range a copy reads.
     #[cfg(feature = "diagnostics")]
@@ -348,6 +348,12 @@ pub(crate) struct HostList {
     /// and at the end, and where they are read back.
     #[cfg(feature = "diagnostics")]
     stamps: OnceLock<Option<(ID3D12QueryHeap, ID3D12Resource)>>,
+}
+
+struct ArgumentBuffer {
+    resource: ID3D12Resource,
+    capacity: u64,
+    readable: bool,
 }
 
 /// Timestamps per list (diagnostics); commands past them are not timed.
@@ -1009,6 +1015,9 @@ impl HostList {
     }
 
     pub(crate) fn close(&self) {
+        if let Some(arguments) = self.arguments.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+            self.finish_arguments(arguments);
+        }
         #[cfg(feature = "diagnostics")]
         if timing() {
             let count = self.notes.lock().unwrap_or_else(|e| e.into_inner()).len() as u32;
@@ -1313,20 +1322,46 @@ impl HostList {
         Some(unsafe { buffer.GetGPUVirtualAddress() })
     }
 
-    /// The list's private argument buffer, in COMMON between uses.
-    pub(crate) fn arguments(&self, bytes: u64) -> Option<ID3D12Resource> {
+    /// Gets the scratch buffer and the state it is in. The caller records
+    /// the clamp and leaves it in INDIRECT_ARGUMENT.
+    pub(crate) fn arguments(&self, bytes: u64) -> Option<(ID3D12Resource, D3D12_RESOURCE_STATES)> {
         let mut arguments = self.arguments.lock().unwrap_or_else(|e| e.into_inner());
-        // SAFETY: a descriptor query on a live resource.
-        if let Some(buffer) = arguments.as_ref().filter(|buffer| unsafe { buffer.GetDesc() }.Width >= bytes) {
-            return Some(buffer.clone());
+        if let Some(buffer) = arguments.as_mut().filter(|buffer| buffer.capacity >= bytes) {
+            let before = if std::mem::replace(&mut buffer.readable, true) {
+                D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT
+            } else {
+                D3D12_RESOURCE_STATE_COMMON
+            };
+            return Some((buffer.resource.clone(), before));
         }
-        let (buffer, _) = host()?.shared_buffer(bytes.checked_next_power_of_two()?.max(1 << 16))?;
+        let capacity = bytes.checked_next_power_of_two()?.max(1 << 16);
+        let (buffer, _) = host()?.shared_buffer(capacity)?;
         name(&buffer, || "indirect arguments".into());
         // Earlier commands can still reference the smaller allocation.
-        if let Some(old) = arguments.replace(buffer.clone()) {
-            self.keep(&old);
+        if let Some(mut old) = arguments.replace(ArgumentBuffer {
+            resource: buffer.clone(),
+            capacity,
+            readable: true,
+        }) {
+            self.finish_arguments(&mut old);
+            self.keep(&old.resource);
         }
-        Some(buffer)
+        Some((buffer, D3D12_RESOURCE_STATE_COMMON))
+    }
+
+    /// A closed list may run again. It must leave its scratch in the same
+    /// state its first use assumed, including any buffer replaced mid-list.
+    fn finish_arguments(&self, buffer: &mut ArgumentBuffer) {
+        if std::mem::take(&mut buffer.readable) {
+            // SAFETY: an open list and its live, indirect-readable buffer.
+            unsafe {
+                self.list.ResourceBarrier(&[transition(
+                    &buffer.resource,
+                    D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+                    D3D12_RESOURCE_STATE_COMMON,
+                )]);
+            }
+        }
     }
 
     /// Keeps `object` alive until the list is reset.
