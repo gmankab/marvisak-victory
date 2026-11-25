@@ -65,6 +65,12 @@ pub(crate) struct Lowered {
     /// Whether the program uses wave operations.
     #[cfg(test)]
     pub wave_ops: bool,
+    /// Whether the module declares `dx.op.waveGetLaneIndex`.
+    #[cfg(test)]
+    pub uses_lane_index: bool,
+    /// Whether the module contains the 32-lane half mask (`!31`).
+    #[cfg(test)]
+    pub has_half_wave_mask: bool,
 }
 
 pub(crate) struct Parts<'a> {
@@ -2410,6 +2416,10 @@ impl<'a> Lower<'a> {
             nonuniform_handles: self.s.nonuniform_handles,
             #[cfg(test)]
             wave_ops: self.s.flags & flags::WAVE_OPS != 0,
+            #[cfg(test)]
+            uses_lane_index: self.s.m.has_function("dx.op.waveGetLaneIndex"),
+            #[cfg(test)]
+            has_half_wave_mask: self.s.m.has_i32_const(!31),
             dxil: self.s.finish(),
             user_data,
             samplers: self.samplers,
@@ -4536,7 +4546,7 @@ impl<'a> Lower<'a> {
             .collect()
     }
 
-    /// LDS (thread-group shared memory) and `ds_swizzle`.
+    /// LDS (thread-group shared memory), `ds_swizzle` and `ds_bpermute`.
     fn ds(&mut self, inst: &Inst, b: usize, i: usize) -> Result<(), Why> {
         let Fields::Ds {
             dst,
@@ -4603,15 +4613,10 @@ impl<'a> Lower<'a> {
             return Ok(());
         }
         if name == "ds_bpermute_b32" {
-            // Backward permute: no LDS is touched. Each lane takes the data
-            // register of the lane its address names, (address + offset) / 4
-            // within the wave; a source lane outside EXEC gives 0. (
-            // the title's checkerboard shadow-mask generators read their
-            // neighbours' samples with it; without them every shadowed light
-            // was multiplied by an empty mask.)
-            // shortcut: a source lane that is not at this instruction on the
-            // host (it left through a branch, not a guard) is read as the
-            // host gives it; the console reads 0.
+            // Each lane reads `data` of the lane its address plus the offset
+            // names in dwords within its own 32-lane half (RDNA 2 ISA,
+            // section 10.4.4: wave64 permutes lanes 0..31 and 32..63
+            // independently); 0 from a lane EXEC leaves out.
             self.cross_lane(false)?;
             if self.exchange.as_ref().is_some_and(|e| !e.1) {
                 // a console wave of 64 run as two host waves: the lane named
@@ -4624,16 +4629,35 @@ impl<'a> Lower<'a> {
             let at = self.s.m.bin(c, Bin::Add, at, o);
             let two = self.s.m.i32(2);
             let src = self.s.m.bin(c, Bin::LShr, at, two);
-            let last = self.s.m.i32(self.wave() - 1);
-            let src = self.s.m.bin(c, Bin::And, src, last);
-            let x = match guard {
-                Some(g) => {
-                    let z = self.s.m.i32(0);
-                    self.s.m.select(c, g, x, z)
-                }
-                None => x,
+            let mask = self.s.m.i32(31);
+            let within = self.s.m.bin(c, Bin::And, src, mask);
+            let (src, upper) = if self.wave() == 64 {
+                let me = self.lane_index();
+                let half_mask = self.s.m.i32(!31);
+                let half = self.s.m.bin(c, Bin::And, me, half_mask);
+                let zero = self.s.m.i32(0);
+                (self.s.m.bin(c, Bin::Or, half, within), Some(self.s.m.cmp(c, pred::NE, half, zero)))
+            } else {
+                (within, None)
             };
             let r = self.read_lane(x, src);
+            let on = guard.unwrap_or_else(|| self.s.m.bool(true));
+            let i32t = self.s.t.i32;
+            let four = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
+            let ballot = self.s.op(c, "waveActiveBallot", Attr::NoUnwind, four, 116, &[on]);
+            let lo = self.s.m.extract(c, ballot, 0);
+            let live = if let Some(upper) = upper {
+                let hi = self.s.m.extract(c, ballot, 1);
+                self.s.m.select(c, upper, hi, lo)
+            } else {
+                lo
+            };
+            let bit = self.s.m.bin(c, Bin::LShr, live, within);
+            let one = self.s.m.i32(1);
+            let bit = self.s.m.bin(c, Bin::And, bit, one);
+            let zero = self.s.m.i32(0);
+            let active = self.s.m.cmp(c, pred::NE, bit, zero);
+            let r = self.s.m.select(c, active, r, zero);
             let reg = dst_reg.ok_or("a permute result")?;
             self.write(inst, Reg::V(reg), r, guard);
             return Ok(());
@@ -12406,5 +12430,83 @@ mod tests {
             S_ENDPGM,
         ];
         lower_wave(&words, Vec::new(), Vec::new(), false).unwrap();
+    }
+
+    #[test]
+    fn ds_bpermute_wave64_preserves_32_lane_half() {
+        // Without reading v0 (`thread_id`), only the wave64 half-wave base
+        // (`lane_index & !31`) introduces `dx.op.waveGetLaneIndex`.
+        let words = [
+            0x7E02_02FF,
+            0x0000_0104, // v_mov_b32 v1, 0x104
+            0x7E04_0285, // v_mov_b32 v2, 5
+            0xDACC_000C,
+            0x0300_0201, // ds_bpermute_b32 v3, v1, v2 offset:12
+            0x7E00_0503, // v_readfirstlane_b32 s0, v3
+            0xBF07_8000, // s_cmp_lg_u32 s0, 0
+            0xBF85_0001, // s_cbranch_scc1 -> s_endpgm
+            0xBE83_0380, // s_mov_b32 s3, 0
+            S_ENDPGM,
+        ];
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        for wave64 in [false, true] {
+            let native = NativeProgram {
+                stage: HwStage::Cs,
+                wave64,
+                vgprs: 8,
+                layout: vec![],
+                used: vec![],
+                io: StageIo::Cs(ComputeIo {
+                    rsrc2: 0,
+                    threads: [if wave64 { 64 } else { 32 }, 1, 1],
+                }),
+                code: code.clone(),
+            };
+            let p = ir::build(&native.code, wave64, native.vgprs).unwrap();
+            let st = structure::structure(&p).unwrap();
+            let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+            let io = io::raise(&p, &native).unwrap();
+            let mut lowered = lower(&Parts {
+                native: &native,
+                p: &p,
+                st: &st,
+                io: &io,
+                res: &res,
+                inputs: vec![],
+                outputs: vec![],
+                prims: vec![],
+                mesh_stride: 0,
+                view_marks: false,
+            })
+            .unwrap();
+            assert!(lowered.wave_ops);
+            assert_eq!(lowered.uses_lane_index, wave64, "wave64={wave64}");
+            assert_eq!(lowered.has_half_wave_mask, wave64, "wave64={wave64}");
+            #[cfg(windows)]
+            if let Ok(mut v) = crate::emit::validator::Validator::load(
+                crate::emit::validator::Validator::default_path().as_deref(),
+            ) {
+                v.validate(&mut lowered.dxil).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn ds_bpermute_refuses_gds() {
+        // ds_bpermute_b32 with gds=1 (bit 17), consumed by a branch, must fail with GDS.
+        let words = [
+            0x7E02_0285,           // v_mov_b32 v1, 5
+            0xDACC_0000 | 1 << 17, // ds_bpermute_b32 gds
+            2 << 24 | 1 << 8,
+            0x7E00_0502, // v_readfirstlane_b32 s0, v2
+            0xBF07_8000, // s_cmp_lg_u32 s0, 0
+            0xBF85_0001, // s_cbranch_scc1 -> s_endpgm
+            0xBE83_0380, // s_mov_b32 s3, 0
+            S_ENDPGM,
+        ];
+        assert!(matches!(
+            lowers(&words, 0),
+            Err(crate::ShaderError::Unsupported { what: "GDS", .. })
+        ));
     }
 }
