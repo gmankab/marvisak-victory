@@ -1335,7 +1335,7 @@ impl HostList {
             return Some((buffer.resource.clone(), before));
         }
         let capacity = bytes.checked_next_power_of_two()?.max(1 << 16);
-        let (buffer, _) = host()?.shared_buffer(capacity)?;
+        let buffer = host()?.indirect_buffer(capacity)?;
         name(&buffer, || "indirect arguments".into());
         // Earlier commands can still reference the smaller allocation.
         if let Some(mut old) = arguments.replace(ArgumentBuffer {
@@ -2194,6 +2194,18 @@ pub(crate) fn legal_for(flags: u32, state: u32) -> u32 {
 }
 
 impl Host {
+    /// Only the GPU reads and writes the private indirect arguments.
+    fn indirect_buffer(&self, size: u64) -> Option<ID3D12Resource> {
+        let heap = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_DEFAULT,
+            ..Default::default()
+        };
+        self.common_uav_buffer(size, &heap)
+            .inspect_err(|e| tracing::debug!(error = %e, size, "indirect arguments in shared memory"))
+            .ok()
+            .or_else(|| self.shared_buffer(size).map(|(buffer, _)| buffer))
+    }
+
     /// A buffer in system memory that the CPU maps (write-back, so reading
     /// it is fast too) and shaders read and write: for host copies of title
     /// memory that shaders write, which upload memory cannot be. Starts in
@@ -2205,6 +2217,26 @@ impl Host {
             MemoryPoolPreference: D3D12_MEMORY_POOL_L0,
             ..Default::default()
         };
+        let made = self.common_uav_buffer(size, &heap).and_then(|buffer| {
+            let mut data = std::ptr::null_mut();
+            // SAFETY: a live buffer on a CPU-visible heap.
+            unsafe { buffer.Map(0, None, Some(&mut data)) }?;
+            Ok((buffer, data.cast()))
+        });
+        match made {
+            Ok(pair) => Some(pair),
+            Err(e) => {
+                tracing::warn!(error = %e, size, "no shared buffer");
+                None
+            }
+        }
+    }
+
+    fn common_uav_buffer(
+        &self,
+        size: u64,
+        heap: &D3D12_HEAP_PROPERTIES,
+    ) -> windows::core::Result<ID3D12Resource> {
         let desc = D3D12_RESOURCE_DESC {
             Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
             Width: size.max(1),
@@ -2220,30 +2252,18 @@ impl Host {
             ..Default::default()
         };
         let mut buffer: Option<ID3D12Resource> = None;
-        let mut data = std::ptr::null_mut();
-        // SAFETY: plain creation and mapping of a CPU-visible buffer.
-        let made = unsafe {
-            self.device
-                .CreateCommittedResource(
-                    &heap,
-                    D3D12_HEAP_FLAG_NONE,
-                    &desc,
-                    D3D12_RESOURCE_STATE_COMMON,
-                    None,
-                    &mut buffer,
-                )
-                .and_then(|()| {
-                    let b = buffer.as_ref().ok_or_else(windows::core::Error::empty)?;
-                    b.Map(0, None, Some(&mut data))
-                })
-        };
-        match made {
-            Ok(()) => Some((buffer?, data.cast())),
-            Err(e) => {
-                tracing::warn!(error = %e, size, "no shared buffer");
-                None
-            }
+        // SAFETY: a buffer description on a heap that permits UAV access.
+        unsafe {
+            self.device.CreateCommittedResource(
+                heap,
+                D3D12_HEAP_FLAG_NONE,
+                &desc,
+                D3D12_RESOURCE_STATE_COMMON,
+                None,
+                &mut buffer,
+            )?;
         }
+        buffer.ok_or_else(windows::core::Error::empty)
     }
 }
 
