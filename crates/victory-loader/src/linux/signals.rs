@@ -280,6 +280,22 @@ extern "C" fn fault_entry(record: *mut ExceptionRecord, context: *mut Context) -
     if record.code == STATUS_STACK_BUFFER_OVERRUN {
         seh::terminate(record, context); // a fast fail is offered to no handler
     }
+    #[cfg(feature = "diagnostics")]
+    if record.code == STATUS_ACCESS_VIOLATION
+        && record.number_parameters >= 2
+        && tracing::enabled!(target: "victory_loader::fault_vm", tracing::Level::DEBUG)
+    {
+        tracing::debug!(
+            target: "victory_loader::fault_vm",
+            ip = format_args!("{:#x}", context.rip),
+            address = format_args!("{:#x}", record.information[1]),
+            access = record.information[0],
+            rdi = format_args!("{:#x}", context.gpr[RDI]),
+            r13 = format_args!("{:#x}", context.gpr[R13]),
+            "hardware access violation before SEH dispatch",
+        );
+        super::vm::report_fault_mappings(record.information[1]);
+    }
     seh::dispatch(record, context)
 }
 

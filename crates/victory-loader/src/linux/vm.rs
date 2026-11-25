@@ -857,6 +857,35 @@ struct Vma {
     prot: libc::c_int,
 }
 
+/// Compare the loader's table and Linux VMAs at a fault and the adjacent
+/// physical pages. Called outside the signal handler, before SEH dispatch.
+#[cfg(feature = "diagnostics")]
+pub(super) fn report_fault_mappings(address: usize) {
+    let probes = [address.saturating_sub(PHYS_PAGE), address, address.saturating_add(PHYS_PAGE)];
+    let state = STATE.try_lock().ok();
+    let available = state.is_some();
+    let guests = probes.map(|at| {
+        let state = state.as_ref()?;
+        let start = find(&state.runs, at)?;
+        let run = &state.runs[&start];
+        let section_offset = run.view.as_ref().map(|(_, offset)| offset + (at - start) as u64);
+        Some((start, run.end, run.base, run.committed, run.protect, run.kind, section_offset))
+    });
+    drop(state);
+    for (at, guest) in probes.into_iter().zip(guests) {
+        let host = host_vma(at);
+        tracing::debug!(
+            target: "victory_loader::fault_vm",
+            probe = format_args!("{at:#x}"),
+            table_available = available,
+            guest_run = ?guest,
+            host_vma = ?host,
+            host_covers = host.is_some_and(|vma| vma.start <= at),
+            "memory at the fault and adjacent 64 KiB pages",
+        );
+    }
+}
+
 /// `struct procmap_query` of `<linux/fs.h>` (Linux 6.11).
 #[repr(C)]
 #[derive(Default)]
