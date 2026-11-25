@@ -129,7 +129,7 @@ fn create_device(warp: bool) -> Result<ID3D12Device, String> {
             ));
         }
         Ok(device)
-
+    }
 }
 
 /// Whether `device` runs on a software adapter (WARP); `true` when that

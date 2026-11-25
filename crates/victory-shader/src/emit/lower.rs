@@ -12476,7 +12476,6 @@ mod tests {
                 outputs: vec![],
                 prims: vec![],
                 mesh_stride: 0,
-                view_marks: false,
             })
             .unwrap();
             assert!(lowered.wave_ops);

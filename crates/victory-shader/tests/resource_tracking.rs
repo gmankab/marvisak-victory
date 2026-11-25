@@ -134,14 +134,14 @@ fn shared_sum_with_two_dynamic_terms_stays_opaque() {
             ),
         ]
     );
-    // Not from a root parameter: title memory.
+    // Compute shaders can address title memory outside their root parameters.
     let memory = Address {
         param: MEMORY,
         offset: 0,
         dynamic: None,
     };
     assert_eq!(
-        track(&program, &[], HwStage::Ps, None).unwrap().scalar,
+        track(&program, &[], HwStage::Cs, None).unwrap().scalar,
         [((0, 3), memory), ((0, 4), memory)]
     );
 }
