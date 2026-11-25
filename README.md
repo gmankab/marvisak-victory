@@ -1,5 +1,25 @@
 # VIctory fork (work in progress)
 
+## World runtime integration
+
+This branch incorporates the changes from
+[ZSlayerHQ's world runtime](https://github.com/ZSlayerHQ/victory-world-runtime/commits/next/),
+including myokex's texture streaming, large dispatch and pipeline changes and
+[JoshuaO22's guarded kernel read fix](https://github.com/JoshuaO22/victory-amd).
+The integration uses Fxceless's descriptor mirroring, placed texture ownership,
+on-demand mip residency and physical page write tracking.
+
+- The texture pass can recover lost views with the heap sweep and refresh textures
+  that change after an upload. Use `VICTORY_TEXTURE_SWEEP=0` and
+  `VICTORY_HEAP_RECHECK=0` to disable those passes.
+- The runtime can split a one-dimensional compute dispatch that exceeds the host
+  group count limit, and preserves pipeline startup order across runs.
+- On Windows, `victory warm` scans the configured game paths to populate the
+  shader and compute pipeline caches. It accepts paths, `--jobs` and
+  `--no-pipelines`.
+- The frame capture and pipeline wait logs include the statistics used to
+  diagnose missing geometry and slow loading.
+
 A work-in-progress fork of [VIctory](https://github.com/Marvisak/VIctory), a
 compatibility layer that runs an Xbox Series title natively on Windows from
 files the user supplies. This fork follows upstream
