@@ -2116,7 +2116,7 @@ fn dispatches_per_part() -> u32 {
         std::env::var("VICTORY_CUT_DISPATCHES")
             .ok()
             .and_then(|v| v.trim().parse().ok())
-            .unwrap_or(32)
+            .unwrap_or(0)
     })
 }
 
@@ -2130,8 +2130,8 @@ fn dispatches_per_part() -> u32 {
 /// list of 182 indirect dispatches (1,149 host commands; it stopped at a
 /// barrier waiting for them, at 0.7-1.3 s of card time a frame); an earlier
 /// run in the same list. With waits cut into lists only (`crate::queue::cuts`).
-/// `VICTORY_CUT_DISPATCHES=<n>` sets the most per part (default 32), `0`
-/// cuts nothing, as before.
+/// `VICTORY_CUT_DISPATCHES=<n>` sets the maximum per part. The default
+/// `0` leaves the list whole.
 #[cfg(windows)]
 fn cut_for_work(this: This) {
     let most = dispatches_per_part();

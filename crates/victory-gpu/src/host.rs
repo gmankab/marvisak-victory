@@ -1291,10 +1291,10 @@ fn lazy_prelude() -> bool {
 /// at DMA-buffer boundaries), and a packet that runs past the timeout (2 s)
 /// resets the driver: a test run lost the device with a submission of a list of
 /// 1,149 commands among 79 lists at 0.7-1.3 s of card time a frame.
-/// `VICTORY_SUBMIT_EACH=0`: one call for the whole submission, as before.
+/// `VICTORY_SUBMIT_EACH=1` enables one call per host list.
 fn submit_each() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_SUBMIT_EACH").is_none_or(|v| v != "0"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SUBMIT_EACH").is_some_and(|v| v == "1"))
 }
 
 /// Sends `lists` to `queue`: in one call, or with [`submit_each`] one call
