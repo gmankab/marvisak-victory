@@ -8,9 +8,9 @@
 //! Linux DXC compiles it, as 6.0, if `VICTORY_DXCOMPILER` names one).
 //!
 //! Each list also has a budget (2^27 vertex instances or threads, groups
-//! counted as 64 threads, mesh groups as 128): records past it run empty,
-//! so a list of thousands of garbage records cannot run for seconds
-//! either.
+//! counted as 64 threads, mesh groups as 128): records past it run empty.
+//! Groups reserve work from a saturating counter so rejected costs cannot
+//! wrap it and admit more records.
 //!
 //! shortcut: the bounds (2^24 vertices, 2^26 vertex instances, 65,535
 //! groups per dimension and 2^20 per dispatch, one-dimensional mesh
@@ -42,17 +42,7 @@ RWByteAddressBuffer budget : register(u1);
 static const uint BUDGET = 1u << 27;
 // Groups of one dispatch; more run empty.
 static const uint GROUPS = 1u << 20;
-[RootSignature(RS)]
-[numthreads(64, 1, 1)]
-void main(uint3 id : SV_DispatchThreadID) {
-    uint active_records = records;
-    if (count_bytes != 0) {
-        active_records = min(active_records, count_buf.Load(0));
-        if (id.x == 0) dest.Store(0, active_records);
-    }
-    if (id.x >= active_records) return;
-    uint at = id.x * stride;
-    uint dst = at + count_bytes;
+uint clamp_record(uint at, uint dst) {
     uint cost;
     if (kind <= 1) {
         // Draws: vertex or index count, then instances.
@@ -80,10 +70,83 @@ void main(uint3 id : SV_DispatchThreadID) {
         cost = g.x * g.y * g.z * 128;
         dest.Store3(dst, g);
     }
-    uint before;
-    budget.InterlockedAdd(0, cost, before);
-    if (before >= BUDGET || before + cost > BUDGET) {
-        // Draws keep their layout with no vertices; groups become zero.
+    return cost;
+}
+
+// Reserve one group's work. A single active group is the only writer, and
+// the UAV barriers between clamps already order its load and store.
+uint reserve_budget(uint cost, bool only_group) {
+    uint before = 0;
+    if (only_group) {
+        before = min(budget.Load(0), BUDGET);
+        if (before < BUDGET) budget.Store(0, before + min(cost, BUDGET - before));
+    } else {
+        budget.InterlockedOr(0, 0, before);
+        [allow_uav_condition]
+        while (before < BUDGET) {
+            uint after = before + min(cost, BUDGET - before);
+            uint observed = before;
+            budget.InterlockedCompareExchange(0, before, after, observed);
+            if (observed == before) break;
+            before = observed;
+        }
+    }
+    return BUDGET - min(before, BUDGET);
+}
+
+groupshared uint costs[64];
+groupshared uint totals[2];
+groupshared uint allowance;
+[RootSignature(RS)]
+[numthreads(64, 1, 1)]
+void main(uint3 group : SV_GroupID, uint lane : SV_GroupIndex) {
+    uint active_records = records;
+    if (count_bytes != 0) {
+        active_records = min(active_records, count_buf.Load(0));
+        if (group.x == 0 && lane == 0) dest.Store(0, active_records);
+    }
+    uint first = group.x * 64u;
+    if (first >= active_records) return;
+    uint active_lanes = min(64u, active_records - first);
+    uint at = (first + lane) * stride;
+    uint dst = at + count_bytes;
+    uint cost = 0;
+    [branch]
+    if (lane < active_lanes) cost = clamp_record(at, dst);
+    if (active_lanes == 1) {
+        if (lane == 0 && cost != 0) {
+            uint left = reserve_budget(cost, active_records == 1);
+            if (cost > left) dest.Store(dst, 0);
+        }
+        return;
+    }
+    costs[lane] = cost;
+    if (lane < 2) totals[lane] = 0;
+    GroupMemoryBarrierWithGroupSync();
+    // A half group fits in uint even if every record costs 2^26.
+    if (cost != 0) {
+        uint unused;
+        InterlockedAdd(totals[lane / 32], cost, unused);
+    }
+    GroupMemoryBarrierWithGroupSync();
+    if (lane == 0) {
+        uint total = min(totals[0], BUDGET + 1u) + min(totals[1], BUDGET + 1u);
+        allowance = 0;
+        if (total != 0) allowance = reserve_budget(total, active_records <= 64);
+        if (allowance >= total) {
+            allowance = BUDGET;
+        } else if (allowance != 0) {
+            // Just the group that straddles the budget needs a prefix.
+            uint prefix = 0;
+            for (uint i = 0; i < active_lanes; i++) {
+                prefix = min(prefix + costs[i], BUDGET + 1u);
+                costs[i] = prefix;
+            }
+        }
+    }
+    GroupMemoryBarrierWithGroupSync();
+    if (cost != 0 && costs[lane] > allowance) {
+        // Clear only the count; the other argument fields keep their layout.
         dest.Store(dst, 0);
     }
 }
@@ -131,13 +194,18 @@ pub(crate) fn compiled() -> windows::core::Result<Vec<u8>> {
 /// The clamp's DXBC, with its root signature.
 #[cfg(windows)]
 fn compiled() -> windows::core::Result<Vec<u8>> {
+    compile_fxc(SOURCE)
+}
+
+#[cfg(windows)]
+fn compile_fxc(source: &str) -> windows::core::Result<Vec<u8>> {
     let mut code: Option<ID3DBlob> = None;
     let mut errors: Option<ID3DBlob> = None;
     // SAFETY: the source and names live through the call; out pointers ours.
     let compiled = unsafe {
         D3DCompile(
-            SOURCE.as_ptr().cast(),
-            SOURCE.len(),
+            source.as_ptr().cast(),
+            source.len(),
             s!("clamp"),
             None,
             None,
@@ -168,8 +236,11 @@ fn compiled() -> windows::core::Result<Vec<u8>> {
 }
 
 fn make() -> windows::core::Result<Clamp> {
+    make_pipeline(&compiled()?)
+}
+
+fn make_pipeline(bytes: &[u8]) -> windows::core::Result<Clamp> {
     let device = &host().ok_or_else(windows::core::Error::empty)?.device;
-    let bytes = &compiled()?[..];
     // SAFETY: the root signature is inside the shader.
     unsafe {
         let root: ID3D12RootSignature = device.CreateRootSignature(0, bytes)?;
@@ -340,12 +411,78 @@ mod tests {
     }
 
     #[test]
+    fn argument_clamp_budget_never_wraps() {
+        let Some(host) = host() else { return };
+        if cfg!(not(windows)) && std::env::var_os("VICTORY_DXCOMPILER").is_none() {
+            return;
+        }
+        let clamp_draws = |draws: &[[u32; 4]]| {
+            let bytes = size_of_val(draws) as u64;
+            let (input, data) = host.shared_buffer(bytes).unwrap();
+            let list = host.new_list().unwrap();
+            // SAFETY: the idle mapping holds all supplied draw records.
+            unsafe {
+                std::ptr::copy_nonoverlapping(draws.as_ptr(), data.cast(), draws.len());
+            }
+            let output = bound(&list, (&input, 0), None, (0, 16, draws.len() as u32))
+                .expect("clamp recorded");
+            done(&list, &output);
+            list.close();
+            host.execute(&[&list]);
+            // SAFETY: the clamp completed and each mapping covers the inspected records.
+            unsafe {
+                let mut mapped = std::ptr::null_mut();
+                output.Map(0, None, Some(&mut mapped)).unwrap();
+                let records = std::slice::from_raw_parts(mapped.cast::<[u32; 4]>(), draws.len());
+                let counts = records.iter().map(|r| r[0]).collect::<Vec<_>>();
+                assert!(records.iter().zip(draws).all(|(clamped, src)| clamped[2..] == src[2..]));
+                assert_eq!(std::slice::from_raw_parts(data.cast::<[u32; 4]>(), draws.len()), draws);
+                output.Unmap(0, None);
+                counts
+            }
+        };
+
+        // Each clamped draw costs 2^26, so only two fit. The old add
+        // wrapped at 64 draws and let a further two through.
+        let large = [u32::MAX, 4, 11, 17];
+        let counts = clamp_draws(&[large; 128]);
+        assert_eq!(counts.iter().filter(|&&vertices| vertices != 0).count(), 2);
+
+        // Lane order within a group is fixed. After two draws, the third
+        // consumes the remainder and the small fourth draw is rejected.
+        let almost = [1 << 24, 3, 11, 17];
+        assert_eq!(
+            clamp_draws(&[almost, almost, almost, [1, 1, 11, 17]]),
+            [1 << 24, 1 << 24, 0, 0]
+        );
+
+        let small = vec![[1, 1, 11, 17]; 1 << 16];
+        assert!(clamp_draws(&small).iter().all(|&vertices| vertices == 1));
+    }
+
+    #[test]
     fn argument_clamp_counted_dispatches_only_active_records() {
         let Some(host) = host() else { return };
         if cfg!(not(windows)) && std::env::var_os("VICTORY_DXCOMPILER").is_none() {
             return;
         }
-        let c = clamp().expect("clamp pipeline");
+        const WITNESS: &str = r#"
+RWByteAddressBuffer output : register(u0);
+[RootSignature("UAV(u0)")]
+[numthreads(1, 1, 1)]
+void main(uint3 group : SV_GroupID) {
+    if (all(group == 0)) {
+        uint unused;
+        output.InterlockedAdd(0, 128, unused);
+    }
+}
+"#;
+        #[cfg(windows)]
+        let witness = compile_fxc(WITNESS).expect("witness shader");
+        #[cfg(not(windows))]
+        let witness =
+            victory_shader::hostlib::compile_hlsl(WITNESS, "main", "cs_6_0").expect("witness shader");
+        let c = make_pipeline(&witness).expect("witness pipeline");
         let argument = D3D12_INDIRECT_ARGUMENT_DESC {
             Type: D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH,
             ..Default::default()
@@ -383,22 +520,16 @@ mod tests {
             let clamped = bound(&list, (&input, 0), Some((&input, 24)), (2, 12, 2)).unwrap();
             assert_eq!(clamped, output);
 
-            // Reuse the clamp as a test compute pipeline. Each indirect
-            // dispatch adds 128 to its separate budget at `witnessed`.
-            let constants = [2u32, 12, 1, 0];
+            // Each executed dispatch increments the same witness, even if
+            // the driver overlaps the commands in this ExecuteIndirect.
             // SAFETY: all buffers live through execution. The private buffer
             // is in INDIRECT_ARGUMENT and has distinct count and argument offsets.
             unsafe {
                 let command = &list.list;
-                let gpu = input.GetGPUVirtualAddress();
                 let witness = witness.GetGPUVirtualAddress();
                 command.SetComputeRootSignature(&c.root);
                 command.SetPipelineState(&c.pso);
-                command.SetComputeRoot32BitConstants(0, 4, constants.as_ptr().cast(), 0);
-                command.SetComputeRootShaderResourceView(1, gpu);
-                command.SetComputeRootUnorderedAccessView(2, witness);
-                command.SetComputeRootUnorderedAccessView(3, witness + 256);
-                command.SetComputeRootShaderResourceView(4, gpu);
+                command.SetComputeRootUnorderedAccessView(0, witness);
                 command.ExecuteIndirect(&signature, 2, &clamped, COUNT_BYTES, Some(&clamped), 0);
             }
             done(&list, &clamped);
