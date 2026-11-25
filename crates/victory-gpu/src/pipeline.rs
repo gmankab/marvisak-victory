@@ -883,6 +883,8 @@ pub(crate) fn frame_log_counts() -> (u64, u64) {
 }
 #[cfg(windows)]
 mod make;
+#[cfg(all(test, windows, feature = "diagnostics"))]
+mod placed_uav_tests;
 
 /// Lets the pipeline library's mapped file go from memory when no pipeline
 /// has loaded for a while (`library::trim`); called by the host's sweep.
