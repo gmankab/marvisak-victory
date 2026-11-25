@@ -290,13 +290,32 @@ fn valid(seen: &Seen) -> Option<(u32, u32)> {
     Some((touched[..pages].iter().filter(|&&t| t).count() as u32, pages as u32))
 }
 
+/// Keeps every address of the stretch mapped while the working set is queried or trimmed.
+fn reading_shown(shown: &[usize], from: usize, to: usize) -> Option<crate::watch::Reading> {
+    let start = shown.iter().min()?.checked_add(from)?;
+    let end = shown.iter().max()?.checked_add(to)?;
+    crate::watch::title_memory_reading_now(start, end.checked_sub(start)?)
+}
+
+#[cfg(test)]
+#[test]
+fn skips_working_set_samples_during_an_alias_remap() {
+    let aliases = [0x5000_0000, 0x4000_0000];
+    for base in aliases {
+        let mapping = crate::watch::title_memory_remapping(base + KERNEL_PAGE, KERNEL_PAGE);
+        assert!(reading_shown(&aliases, KERNEL_PAGE, 2 * KERNEL_PAGE).is_none());
+        drop(mapping);
+    }
+    assert!(reading_shown(&aliases, KERNEL_PAGE, 2 * KERNEL_PAGE).is_some());
+}
+
 /// Takes the stretch's 4 KiB pages out of the working set at every title
 /// address of the page; false, with nothing done, while the runtime
 /// changes a mapping.
 fn trim(shown: &[usize], from: usize, to: usize) -> bool {
     use windows_sys::Win32::System::Memory::VirtualUnlock;
     // No mapping changes until the addresses have been used.
-    let Some(_still) = crate::watch::title_memory_reading_now() else {
+    let Some(_still) = reading_shown(shown, from, to) else {
         return false;
     };
     for &base in shown {
@@ -318,7 +337,7 @@ fn judge(seen: &Seen) -> Judged {
         && seen.clean
         && (!crate::watch::clean(seen.page) || crate::watch::stamp(seen.page) > seen.stamp);
     let looked = if seen.trimmed {
-        match crate::watch::title_memory_reading_now() {
+        match reading_shown(&seen.shown, seen.from, seen.to) {
             Some(_still) => valid(seen),
             None => None,
         }
