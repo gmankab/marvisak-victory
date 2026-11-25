@@ -349,6 +349,14 @@ fn find_module(path: &str, load: bool) -> Option<*mut c_void> {
     } else {
         format!("{file}.dll")
     };
+    // `VICTORY_NO_FSR=1`: the title's FSR upscaler is not there, so the
+    // title may fall back to an upscaler of its own.
+    if no_fsr() && file.eq_ignore_ascii_case(FSR_DLL) {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| tracing::info!(dll = file, "refused (VICTORY_NO_FSR=1)"));
+        host::set_last_error(ERROR_MOD_NOT_FOUND);
+        return Some(std::ptr::null_mut());
+    }
     // Loads go through the title DLL loader first: it waits for a DLL that
     // another thread is still initialising, as the Windows loader lock does.
     if load {
@@ -396,6 +404,15 @@ fn refuse(file: &str) {
 }
 
 const ERROR_MOD_NOT_FOUND: u32 = 126;
+
+/// The title's FSR upscaler DLL, which `VICTORY_NO_FSR=1` refuses.
+const FSR_DLL: &str = "amd_fidelityfx_upscaler_xbox.dll";
+
+/// Whether `VICTORY_NO_FSR=1` (off by default).
+fn no_fsr() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_NO_FSR").is_some_and(|v| v == "1"))
+}
 
 pub(crate) fn module() -> HleModule {
     HleModule {

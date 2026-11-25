@@ -1114,12 +1114,125 @@ fn execute_now(this: This, count: u32, lists: *const This) {
     }
 }
 
-/// The start of a present plane: frame token, then the plane's resources.
+/// The start of a present plane (`D3D12XBOX_PRESENT_PLANE_PARAMETERS`):
+/// frame token, then the plane's resources. The whole description is
+/// [`PLANE_STRIDE`] bytes; the fields after these are read by offset
+/// ([`plane_at`]).
 #[repr(C)]
 pub(crate) struct Plane {
     token: u64,
     count: u32,
     resources: *const This,
+}
+
+/// Bytes of one plane description, in the field order of the public GDK
+/// binding (ebiten's `_D3D12XBOX_PRESENT_PLANE_PARAMETERS`, as a public GDK
+/// header has it): `Token` u64 @0, `ResourceCount` u32 @8,
+/// `ppResources` @16, `pSrcViewRects` (`D3D12_RECT*`) @24,
+/// `pDestPlacementBase` (four floats, fractions of the output) @32,
+/// `ColorSpace` @40, `ScaleFilter` @44, `ExtendedDescCount` @48,
+/// `pExtendedDescs` @56, `Flags` @64. Checked at each present of more than
+/// one plane: the second plane must carry the first's token
+/// ([`plane_stride`]).
+#[cfg(windows)]
+const PLANE_STRIDE: usize = 72;
+
+/// The stride of the title's plane descriptions: the first candidate at
+/// which the second plane has plane 0's token and a plausible resource
+/// list (and whether one did), else [`PLANE_STRIDE`].
+#[cfg(windows)]
+fn plane_stride(planes: u32, base: *const u8) -> (usize, bool) {
+    if planes < 2 {
+        return (PLANE_STRIDE, true);
+    }
+    // SAFETY: the title passes at least two descriptions, each at least as
+    // long as the largest candidate (the binding's 72 bytes).
+    unsafe {
+        let token = base.cast::<u64>().read_unaligned();
+        for stride in [PLANE_STRIDE, 64, 56, 48, 40, 32, 24] {
+            let next = base.add(stride);
+            let count = next.add(8).cast::<u32>().read_unaligned();
+            let list = next.add(16).cast::<usize>().read_unaligned();
+            if next.cast::<u64>().read_unaligned() == token
+                && (1..=8).contains(&count)
+                && list != 0
+                && list % 8 == 0
+            {
+                return (stride, true);
+            }
+        }
+    }
+    (PLANE_STRIDE, false)
+}
+
+/// Plane `i`'s first resource, source rectangle (`[left, top, right,
+/// bottom]` in texels) and destination placement (fractions of the
+/// output), each `None` when absent.
+#[cfg(windows)]
+#[allow(clippy::type_complexity)]
+fn plane_at(base: *const u8, stride: usize, i: usize) -> Option<(This, Option<[i32; 4]>, Option<[f32; 4]>)> {
+    // SAFETY: plane `i` of the title's descriptions; its pointers, when
+    // set, point at what the binding names.
+    unsafe {
+        let at = base.add(stride * i);
+        let count = at.add(8).cast::<u32>().read_unaligned();
+        let list = at.add(16).cast::<*const This>().read_unaligned();
+        if count == 0 || list.is_null() {
+            return None;
+        }
+        let resource = list.read_unaligned();
+        let (mut src, mut dest) = (None, None);
+        if stride >= 32 {
+            let rect = at.add(24).cast::<*const [i32; 4]>().read_unaligned();
+            if !rect.is_null() {
+                src = Some(rect.read_unaligned());
+            }
+        }
+        if stride >= 40 {
+            let place = at.add(32).cast::<*const [f32; 4]>().read_unaligned();
+            if !place.is_null() {
+                dest = Some(place.read_unaligned());
+            }
+        }
+        Some((resource, src, dest))
+    }
+}
+
+/// Whether presents compose every plane (`VICTORY_PRESENT_PLANES`, on
+/// unless `0`), and with premultiplied alpha (`=premul`) rather than
+/// straight.
+#[cfg(windows)]
+fn compose_planes() -> (bool, bool) {
+    static ON: std::sync::OnceLock<(bool, bool)> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| match std::env::var("VICTORY_PRESENT_PLANES").as_deref() {
+        Ok("0") => (false, false),
+        Ok("premul") => (true, true),
+        _ => (true, false),
+    })
+}
+
+/// Logs the planes of a present when what they are changes: count,
+/// stride, each plane's size, format and rectangles, and the raw words.
+#[cfg(windows)]
+fn log_planes(planes: u32, base: *const u8, stride: usize, found: bool, shown: &[crate::host::Shown<'_>]) {
+    static LAST: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
+    let mut text = format!("{planes} planes, stride {stride}{}:", if found { "" } else { " (not confirmed)" });
+    for p in shown {
+        // SAFETY: a live resource.
+        let d = unsafe { p.texture.GetDesc() };
+        text += &format!(" [{}x{} f{} src {:?} dest {:?}]", d.Width, d.Height, d.Format.0, p.src, p.dest);
+    }
+    let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+    if *last != text {
+        // SAFETY: the title's descriptions: `planes` (at least two) of the
+        // stride found, read no further than that.
+        let words = planes.min(4) as usize * stride / 8;
+        let raw: Vec<String> = (0..words)
+            .map(|k| format!("{:#x}", unsafe { base.cast::<u64>().add(k).read_unaligned() }))
+            .collect();
+        tracing::info!(planes = %text, raw = ?raw, "present planes changed");
+        *last = text;
+    }
 }
 /// Submission tagged with the frame it belongs to `(count, lists, frame
 /// token, flags)`; frames are paced elsewhere, so it runs as a plain one.
@@ -1281,7 +1394,9 @@ pub(crate) fn presented() -> u64 {
     FRAMES.load(Ordering::Relaxed)
 }
 
-/// Shows the first plane's first resource in our window.
+/// Shows the planes in our window. One plane (or `VICTORY_PRESENT_PLANES=0`):
+/// its first resource, copied as it is. Several (Series S: the game plane
+/// under a UI plane): composed ([`crate::host::Host::present_planes`]).
 ///
 /// shortcut: one plane, no scaling or placement, the source expected in
 /// the common state.
@@ -1311,10 +1426,13 @@ fn present_now(this: This, planes: u32, plane_parameters: *const Plane) -> HRESU
     crate::copystat::present_begins();
     #[cfg(all(windows, feature = "diagnostics"))]
     crate::profile::frame();
-    // With `present_behind`: the frame is shown by our thread, behind what
-    // the queue holds, and nothing is run or waited for here.
     #[cfg(windows)]
-    let sent_behind = present_behind() && send_behind(this, planes, plane_parameters);
+    let composing = compose_planes().0 && planes > 1 && !plane_parameters.is_null();
+    // With `present_behind`: the frame is shown by our thread, behind what
+    // the queue holds. That path holds one texture, so multi-plane
+    // composition uses the present's existing synchronous path.
+    #[cfg(windows)]
+    let sent_behind = !composing && present_behind() && send_behind(this, planes, plane_parameters);
     #[cfg(not(windows))]
     let _ = this;
     // Submissions sent to the card and not waited for are settled first,
@@ -1388,6 +1506,39 @@ fn present_now(this: This, planes: u32, plane_parameters: *const Plane) -> HRESU
         if crate::capture::listed(frame) {
             crate::capture::dump_targets(frame);
         }
+    }
+    #[cfg(windows)]
+    if composing {
+        let base = plane_parameters.cast::<u8>();
+        let (stride, found) = plane_stride(planes, base);
+        let mut titled: Vec<This> = Vec::new();
+        let mut shown: Vec<crate::host::Shown<'_>> = Vec::new();
+        for i in 0..planes.min(4) as usize {
+            if let Some((resource, src, dest)) = plane_at(base, stride, i)
+                && !titled.contains(&resource)
+                && let Some(texture) = crate::resource::host_resource(resource)
+            {
+                const SHADER_RESOURCE: u32 = 0x80;
+                let state = crate::resource::host_transition(resource, SHADER_RESOURCE)
+                    .map_or(SHADER_RESOURCE, |(_, before)| before);
+                titled.push(resource);
+                shown.push(crate::host::Shown { texture, state, src, dest });
+            }
+        }
+        log_planes(planes, base, stride, found, &shown);
+        if let Some(host) = crate::host::host()
+            && !shown.is_empty()
+        {
+            let shown_now = host.present_planes(&shown, compose_planes().1, frame);
+            #[cfg(feature = "diagnostics")]
+            blinks(frame, titled[0], shown[0].state, shown_now);
+            #[cfg(not(feature = "diagnostics"))]
+            let _ = shown_now;
+        }
+        for (resource, plane) in titled.iter().zip(&shown) {
+            crate::resource::host_transition(*resource, plane.state);
+        }
+        return S_OK;
     }
     #[cfg(windows)]
     if !sent_behind

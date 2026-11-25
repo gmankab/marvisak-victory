@@ -2875,6 +2875,110 @@ impl State {
         }
     }
 
+    /// In place of a dropped FSR dispatch: the textures the compute tables
+    /// hold (up to 32 descriptors from each table's start, inside its
+    /// heap: the program's own layout is not known), the frame it upscales
+    /// stretched into its output ([`crate::standin::choose`]), once per
+    /// output and frame.
+    fn fsr_stand_in(&mut self, list: &HostList) {
+        const STEP: u64 = 32;
+        const MOST: u64 = 32;
+        let tables: Vec<u64> = self
+            .compute
+            .iter()
+            .filter_map(|r| match r {
+                Root::Table(t) => Some(*t),
+                _ => None,
+            })
+            .collect();
+        let mut found: Vec<(View, usize, &ID3D12Resource, crate::standin::Seen)> = Vec::new();
+        for table in tables {
+            let Some(heap) = self.heap_of(table) else {
+                continue;
+            };
+            for k in 0..MOST {
+                let handle = table + k * STEP;
+                if heap.index(handle).is_none() {
+                    break;
+                }
+                let Some(view) = crate::descriptor::view(handle) else {
+                    continue;
+                };
+                let resolved = crate::descriptor::host::placed_texture(&view);
+                let (uav, resource) = match resolved.as_ref().unwrap_or(&view) {
+                    View::Shader(r, _) => (false, *r),
+                    View::Unordered(r, _, _) => (true, *r),
+                    _ => continue,
+                };
+                if found.iter().any(|f| f.1 == resource && f.3.uav == uav) {
+                    continue;
+                }
+                let Some(texture) = crate::resource::host_resource(resource as This) else {
+                    continue;
+                };
+                // SAFETY: a live resource.
+                let d = unsafe { texture.GetDesc() };
+                if d.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D {
+                    continue;
+                }
+                let seen = crate::standin::Seen { uav, width: d.Width as u32, height: d.Height, format: d.Format.0 };
+                found.push((view, resource, texture, seen));
+            }
+        }
+        let seen: Vec<crate::standin::Seen> = found.iter().map(|f| f.3).collect();
+        let Some((input, outputs, _)) = crate::standin::choose(&seen) else {
+            static TOLD: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            if TOLD.fetch_add(1, Ordering::Relaxed) < 4 {
+                tracing::info!(?seen, "FSR stand-in: no input and output in a dropped FSR dispatch's tables");
+            }
+            return;
+        };
+        let frame = crate::frame::current();
+        let mut ran = false;
+        for o in outputs {
+            let (view, resource, texture, s) = &found[o];
+            let shared = s.format == crate::standin::SHARED_EXPONENT;
+            let fits = if shared {
+                crate::standin::fits_shared_exponent(found[input].2, texture)
+            } else {
+                crate::standin::fits(found[input].2, texture)
+            };
+            if !fits || !crate::standin::first_this_frame(*resource, frame) {
+                continue;
+            }
+            let mode = crate::standin::mode_for(found[input].3.format, s.format);
+            readable(list, ResourceType::Srv, &found[input].0);
+            readable(list, ResourceType::Uav, view);
+            crate::standin::note_pair((found[input].1, found[input].3), (*resource, *s), mode);
+            #[cfg(feature = "diagnostics")]
+            {
+                static TOLD: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                if TOLD.fetch_add(1, Ordering::Relaxed) < 8 {
+                    let all: Vec<String> = found
+                        .iter()
+                        .map(|f| format!("{:#x} {:?}", f.1, f.3))
+                        .collect();
+                    tracing::info!(?all, "FSR stand-in: the textures of the dispatch it stands in for");
+                }
+            }
+            #[cfg(feature = "diagnostics")]
+            list.note_op(|| format!("FSR stand-in {:#x} -> {resource:#x}", found[input].1));
+            if shared {
+                // Written by copies: in the copy-destination state.
+                crate::list::ensure_state(list, *resource as This, 0x400);
+                ran |= crate::standin::stretch_shared_exponent(&list.list, found[input].2, texture);
+            } else {
+                ran |= crate::standin::stretch(&list.list, found[input].2, texture, mode);
+            }
+        }
+        if ran {
+            // Our heap, root signature and pipeline are set now.
+            self.host_pipeline = 0;
+            self.host_roots = [0; 2];
+            self.host_heaps = [0; 2];
+        }
+    }
+
     /// Runs a dispatch on the host.
     pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32) {
         // It may write the arguments a window holds clamped.
@@ -2908,6 +3012,11 @@ impl State {
                 "a dispatch without a host pipeline dropped"
             );
             DROPPED.fetch_add(1, Ordering::Relaxed);
+            // AMD's FSR (DXBC programs without DXIL): its input stretched
+            // into its output in its place (`crate::standin`).
+            if crate::standin::on() && crate::pipeline::without_dxil(self.pipeline as This) {
+                self.fsr_stand_in(list);
+            }
             #[cfg(feature = "diagnostics")]
             {
                 crate::pipeline::note_drop(self.pipeline as This);

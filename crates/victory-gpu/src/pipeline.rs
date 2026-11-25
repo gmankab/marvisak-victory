@@ -378,6 +378,26 @@ pub(crate) fn walk_held(this: This) -> bool {
     true
 }
 
+/// Whether `this` is a compute pipeline whose program comes in a
+/// container with no DXIL part (SM5 DXBC code, which does not translate):
+/// in the title exactly the 20 compute programs of AMD's FSR 4 upscaler
+/// (`amd_fidelityfx_upscaler_xbox.dll`, its "NewBE" fallback after its
+/// pipeline cache fails), whose dispatches the upscaler stand-in replaces
+/// (`crate::standin`).
+#[cfg(windows)]
+pub(crate) fn without_dxil(this: This) -> bool {
+    !this.is_null() && pipeline(this).no_dxil
+}
+
+#[cfg(windows)]
+fn no_dxil(shaders: &[Arc<Shader>]) -> bool {
+    match shaders {
+        [only] if only.stage == "compute" => victory_shader::Container::parse(&only.container)
+            .is_ok_and(|c| c.part(victory_shader::FourCC::DXIL).is_none()),
+        _ => false,
+    }
+}
+
 /// Whether the title's pipeline `this` is one of the structure builder's.
 #[cfg(windows)]
 pub(crate) fn is_builder(this: This) -> bool {
@@ -471,6 +491,10 @@ struct Pipeline {
     /// One of the ray-tracing structure builder's ([`Builder`]).
     #[cfg(windows)]
     builder: bool,
+    /// A compute program in a container without a DXIL part
+    /// ([`without_dxil`]).
+    #[cfg(windows)]
+    no_dxil: bool,
 }
 const _: () = assert!(offset_of!(Pipeline, packet) == 0x10);
 
@@ -665,6 +689,8 @@ fn hand_out(
         host,
         #[cfg(windows)]
         builder,
+        #[cfg(windows)]
+        no_dxil: no_dxil(&shaders),
         shaders,
         bound: std::sync::atomic::AtomicBool::new(false),
     });

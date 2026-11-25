@@ -917,6 +917,16 @@ fn create() -> windows::core::Result<Host> {
         let adapter = CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0))
             .and_then(|factory| factory.EnumAdapterByLuid::<IDXGIAdapter3>(device.GetAdapterLuid()))
             .ok();
+        // How finely the system can take the card from a submission: with
+        // DMA-buffer preemption a submission runs to its end once started,
+        // and one that runs past the timeout (2 s) resets the driver.
+        if let Some(desc) = adapter.as_ref().and_then(|a| a.GetDesc2().ok()) {
+            tracing::info!(
+                graphics = desc.GraphicsPreemptionGranularity.0,
+                compute = desc.ComputePreemptionGranularity.0,
+                "host adapter preemption (graphics 0 = DMA buffer, 1 primitive, 2 triangle, 3 pixel, 4 instruction; compute 0 = DMA buffer, 1 dispatch, 2 thread group, 3 thread, 4 instruction)"
+            );
+        }
         tracing::info!("host D3D12 device ready");
         Ok(Host {
             device,
@@ -1048,6 +1058,18 @@ mod tests {
         drop(shadows);
         // SAFETY: the lists completed and the copies were unregistered.
         unsafe { VirtualFree(allocation, 0, MEM_RELEASE); }
+    }
+
+    #[test]
+    fn submission_pieces_one_call_per_run() {
+        use super::submission_pieces;
+        // Three runs (prelude + list, list, prelude + list) and the compare.
+        assert_eq!(submission_pieces(6, &[0, 2, 3], true), vec![(0, 2), (2, 3), (3, 6)]);
+        assert_eq!(submission_pieces(6, &[0, 2, 3], false), vec![(0, 6)]);
+        assert_eq!(submission_pieces(1, &[0], true), vec![(0, 1)]);
+        assert_eq!(submission_pieces(0, &[], true), Vec::<(usize, usize)>::new());
+        // Starts past the end or repeated are ignored.
+        assert_eq!(submission_pieces(3, &[0, 1, 1, 7], true), vec![(0, 1), (1, 3)]);
     }
 
     #[test]
@@ -1194,6 +1216,9 @@ pub(crate) struct HostList {
     indirect_args: Mutex<Option<(ID3D12Resource, u64)>>,
     /// The buffers of `crate::indirect::window_check`, made at its first use.
     window_check: OnceLock<Option<crate::indirect::WindowCheck>>,
+    /// The title's dispatches recorded on it (`crate::list`'s cuts after
+    /// so many), zeroed at its reset.
+    dispatches: AtomicU32,
     /// Counts the list in [`ALIVE`] while it lives.
     _alive: Counted,
     /// The pair of timestamps its run is timed with since its last reset
@@ -1258,6 +1283,53 @@ const GATHER_SETS: usize = 8;
 fn lazy_prelude() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_LAZY_PRELUDE").is_none_or(|v| v != "0"))
+}
+
+/// Whether each host list of a submission (with its prelude) goes to the
+/// card in an `ExecuteCommandLists` of its own. The system can take the
+/// card back only between the packets it is given (AMD: compute preemption
+/// at DMA-buffer boundaries), and a packet that runs past the timeout (2 s)
+/// resets the driver: a test run lost the device with a submission of a list of
+/// 1,149 commands among 79 lists at 0.7-1.3 s of card time a frame.
+/// `VICTORY_SUBMIT_EACH=0`: one call for the whole submission, as before.
+fn submit_each() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SUBMIT_EACH").is_none_or(|v| v != "0"))
+}
+
+/// Sends `lists` to `queue`: in one call, or with [`submit_each`] one call
+/// for each host list's run (`firsts`: where each starts; what follows
+/// the last start, our compare of card copies included, goes with it).
+///
+/// # Safety
+/// As `ExecuteCommandLists`: closed lists whose resources stay alive.
+unsafe fn send_each(queue: &ID3D12CommandQueue, lists: &[Option<ID3D12CommandList>], firsts: &[usize]) {
+    for (from, to) in submission_pieces(lists.len(), firsts, submit_each()) {
+        // SAFETY: as the caller's.
+        unsafe { queue.ExecuteCommandLists(&lists[from..to]) };
+    }
+}
+
+/// The ranges of a submission's `count` lists that [`send_each`] sends in
+/// one call each: all of them, or (`each`) one per run starting at
+/// `firsts` (lists before the first start join the first run).
+fn submission_pieces(count: usize, firsts: &[usize], each: bool) -> Vec<(usize, usize)> {
+    let mut starts: Vec<usize> = firsts.iter().copied().filter(|&f| f > 0 && f < count).collect();
+    if !each {
+        starts.clear();
+    }
+    starts.sort_unstable();
+    starts.dedup();
+    let mut pieces = Vec::with_capacity(starts.len() + 1);
+    let mut from = 0;
+    for start in starts {
+        pieces.push((from, start));
+        from = start;
+    }
+    if from < count {
+        pieces.push((from, count));
+    }
+    pieces
 }
 
 /// Timestamps per list (diagnostics); commands past them are not timed.
@@ -4825,6 +4897,7 @@ impl Host {
                 card_budget: OnceLock::new(),
                 indirect_args: Mutex::default(),
                 window_check: OnceLock::new(),
+                dispatches: AtomicU32::new(0),
                 _alive: Counted::new(),
                 meter: AtomicU32::new(u32::MAX),
                 pipeline_meter: AtomicU32::new(u32::MAX),
@@ -6499,7 +6572,7 @@ impl Host {
             *submitted += 1;
             // SAFETY: closed lists; the fence is ours.
             let signalled = unsafe {
-                self.queue.ExecuteCommandLists(&lists);
+                send_each(&self.queue, &lists, &firsts);
                 self.queue.Signal(&self.fence, *submitted)
             };
             self.card_sent();
@@ -6546,7 +6619,11 @@ impl Host {
             let started = std::time::Instant::now();
             // SAFETY: closed lists; the fence and event are ours.
             unsafe {
-                self.queue.ExecuteCommandLists(group);
+                if groups.len() == 1 {
+                    send_each(&self.queue, group, &firsts);
+                } else {
+                    self.queue.ExecuteCommandLists(group);
+                }
                 self.card_sent();
                 let waited = self
                     .queue
@@ -7152,10 +7229,21 @@ impl HostList {
 
     /// Only after the list's last submission finished (every one is waited
     /// for).
+    /// The title's dispatches recorded on the list so far.
+    pub(crate) fn dispatches(&self) -> u32 {
+        self.dispatches.load(Ordering::Relaxed)
+    }
+
+    /// Counts one more of the title's dispatches on the list.
+    pub(crate) fn count_dispatch(&self) {
+        self.dispatches.fetch_add(1, Ordering::Relaxed);
+    }
+
     pub(crate) fn reset(&self) {
         #[cfg(feature = "diagnostics")]
         let started = std::time::Instant::now();
         self._alive.used();
+        self.dispatches.store(0, Ordering::Relaxed);
         *self.deferred() = Deferred::default();
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.twins.lock().unwrap_or_else(|e| e.into_inner()).clear();
@@ -9581,6 +9669,359 @@ impl Meter {
         });
     }
 }
+/// A present plane to show ([`Host::present_planes`]): its host texture,
+/// the host state it is in and stays in, and, as the title gave them, the
+/// source rectangle (`[left, top, right, bottom]` texels) and destination
+/// placement (fractions of the output). A rectangle that is not inside
+/// the texture, or a placement not inside 0..1, is taken as absent.
+pub(crate) struct Shown<'a> {
+    pub(crate) texture: &'a ID3D12Resource,
+    pub(crate) state: u32,
+    pub(crate) src: Option<[i32; 4]>,
+    pub(crate) dest: Option<[f32; 4]>,
+}
+
+/// What a presented frame's recording hands back: in diagnostics builds
+/// the read-back to save and the probe of blackness.
+#[cfg(feature = "diagnostics")]
+type Seen = (
+    Option<(ID3D12Resource, D3D12_PLACED_SUBRESOURCE_FOOTPRINT)>,
+    Option<ID3D12Resource>,
+);
+#[cfg(not(feature = "diagnostics"))]
+type Seen = ();
+
+/// The pass that composes present planes: a triangle over the placement,
+/// the plane's source rectangle sampled bilinearly.
+const COMPOSE: &str = r#"
+#define RS "DescriptorTable(SRV(t0), visibility = SHADER_VISIBILITY_PIXEL), RootConstants(num32BitConstants = 4, b0, visibility = SHADER_VISIBILITY_PIXEL), StaticSampler(s0, filter = FILTER_MIN_MAG_MIP_LINEAR, addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_CLAMP, visibility = SHADER_VISIBILITY_PIXEL)"
+Texture2D<float4> plane : register(t0);
+SamplerState clamped : register(s0);
+cbuffer Source : register(b0) { float4 source; };
+struct Corner { float4 p : SV_Position; float2 t : TEXCOORD0; };
+Corner corner(uint i : SV_VertexID) {
+    Corner c;
+    c.t = float2(float(i & 1) * 2.0, float(i >> 1) * 2.0);
+    c.p = float4(c.t.x * 2.0 - 1.0, 1.0 - c.t.y * 2.0, 0.0, 1.0);
+    return c;
+}
+[RootSignature(RS)]
+float4 compose(Corner c) : SV_Target {
+    return plane.SampleLevel(clamped, lerp(source.xy, source.zw, c.t), 0);
+}
+"#;
+
+/// Views of planes, in a heap of ours used as a ring (a few a frame).
+const COMPOSE_VIEWS: u32 = 64;
+
+/// The compose pass: its shaders, views and, per target format and blend
+/// (0 opaque, 1 straight alpha, 2 premultiplied), the pipeline.
+struct ComposePass {
+    vs: Vec<u8>,
+    ps: Vec<u8>,
+    root: ID3D12RootSignature,
+    views: ID3D12DescriptorHeap,
+    cpu: usize,
+    gpu: u64,
+    step: u32,
+    next: AtomicU32,
+    made: Mutex<Vec<(i32, u8, Option<ID3D12PipelineState>)>>,
+}
+
+// SAFETY: D3D12 objects are free-threaded.
+unsafe impl Send for ComposePass {}
+// SAFETY: as above.
+unsafe impl Sync for ComposePass {}
+
+fn compose_pass() -> Option<&'static ComposePass> {
+    static PASS: OnceLock<Option<ComposePass>> = OnceLock::new();
+    PASS.get_or_init(|| {
+        let made = || -> windows::core::Result<ComposePass> {
+            use windows::core::s;
+            let host = host().ok_or_else(windows::core::Error::empty)?;
+            let vs = compile(COMPOSE, s!("corner"), s!("vs_5_1"))?;
+            let ps = compile(COMPOSE, s!("compose"), s!("ps_5_1"))?;
+            let kind = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+            // SAFETY: the root signature is inside the pixel shader; plain
+            // heap creation and queries.
+            unsafe {
+                let root: ID3D12RootSignature = host.device.CreateRootSignature(0, &ps[..])?;
+                let views: ID3D12DescriptorHeap = host.device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                    Type: kind,
+                    NumDescriptors: COMPOSE_VIEWS,
+                    Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+                    NodeMask: 0,
+                })?;
+                Ok(ComposePass {
+                    cpu: views.GetCPUDescriptorHandleForHeapStart().ptr,
+                    gpu: views.GetGPUDescriptorHandleForHeapStart().ptr,
+                    step: host.device.GetDescriptorHandleIncrementSize(kind),
+                    vs,
+                    ps,
+                    root,
+                    views,
+                    next: AtomicU32::new(0),
+                    made: Mutex::default(),
+                })
+            }
+        };
+        made()
+            .inspect_err(|e| tracing::warn!(error = %e, "no pass to compose present planes"))
+            .ok()
+    })
+    .as_ref()
+}
+
+impl ComposePass {
+    /// The pipeline drawing into `format` with blend `blend`.
+    fn pipeline(&self, device: &ID3D12Device, format: DXGI_FORMAT, blend: u8) -> Option<ID3D12PipelineState> {
+        let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((_, _, pipeline)) = made.iter().find(|m| (m.0, m.1) == (format.0, blend)) {
+            return pipeline.clone();
+        }
+        let code = |bytes: &[u8]| D3D12_SHADER_BYTECODE {
+            pShaderBytecode: bytes.as_ptr().cast(),
+            BytecodeLength: bytes.len(),
+        };
+        let mut blend_state = D3D12_BLEND_DESC::default();
+        blend_state.RenderTarget[0] = D3D12_RENDER_TARGET_BLEND_DESC {
+            BlendEnable: (blend != 0).into(),
+            SrcBlend: if blend == 2 { D3D12_BLEND_ONE } else { D3D12_BLEND_SRC_ALPHA },
+            DestBlend: D3D12_BLEND_INV_SRC_ALPHA,
+            BlendOp: D3D12_BLEND_OP_ADD,
+            SrcBlendAlpha: D3D12_BLEND_ONE,
+            DestBlendAlpha: D3D12_BLEND_INV_SRC_ALPHA,
+            BlendOpAlpha: D3D12_BLEND_OP_ADD,
+            RenderTargetWriteMask: 0xf,
+            ..Default::default()
+        };
+        let mut formats = [DXGI_FORMAT_UNKNOWN; 8];
+        formats[0] = format;
+        // SAFETY: the description points at live data and never releases
+        // its pointer.
+        let pipeline = unsafe {
+            device.CreateGraphicsPipelineState::<ID3D12PipelineState>(&D3D12_GRAPHICS_PIPELINE_STATE_DESC {
+                pRootSignature: std::mem::transmute_copy(&self.root),
+                VS: code(&self.vs),
+                PS: code(&self.ps),
+                BlendState: blend_state,
+                SampleMask: u32::MAX,
+                RasterizerState: D3D12_RASTERIZER_DESC {
+                    FillMode: D3D12_FILL_MODE_SOLID,
+                    CullMode: D3D12_CULL_MODE_NONE,
+                    DepthClipEnable: true.into(),
+                    ..Default::default()
+                },
+                PrimitiveTopologyType: D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
+                NumRenderTargets: 1,
+                RTVFormats: formats,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                ..Default::default()
+            })
+        }
+        .inspect_err(|e| tracing::warn!(error = %e, format = format.0, blend, "no pipeline to compose present planes"))
+        .ok();
+        made.push((format.0, blend, pipeline.clone()));
+        pipeline
+    }
+}
+
+/// The format a plane of `format` is read with: typeless ones as their
+/// UNORM or float member; `None` for what a float sampler cannot read.
+fn view_format(format: DXGI_FORMAT) -> Option<DXGI_FORMAT> {
+    Some(DXGI_FORMAT(match format.0 {
+        27 => 28,
+        28 | 29 | 31 => format.0,
+        87 | 91 => format.0,
+        90 => 87,
+        23 => 24,
+        24 => 24,
+        9 => 10,
+        10 | 11 | 13 => format.0,
+        _ => return None,
+    }))
+}
+
+/// The back buffer view a plane of `format` is drawn through: sRGB when
+/// the plane is (its texels are decoded when read and encoded again here,
+/// so its bytes arrive as stored).
+fn target_format(plane: DXGI_FORMAT, back: DXGI_FORMAT) -> DXGI_FORMAT {
+    match (plane.0, back) {
+        (29, DXGI_FORMAT_R8G8B8A8_UNORM) => DXGI_FORMAT_R8G8B8A8_UNORM_SRGB,
+        (91, DXGI_FORMAT_B8G8R8A8_UNORM) => DXGI_FORMAT_B8G8R8A8_UNORM_SRGB,
+        _ => back,
+    }
+}
+
+/// A plane's source rectangle as fractions of its texture, `[u0, v0, u1,
+/// v1]`: the whole texture unless the title's rectangle lies inside it.
+fn source_fractions(src: Option<[i32; 4]>, width: u32, height: u32) -> [f32; 4] {
+    match src {
+        Some([l, t, r, b])
+            if 0 <= l && l < r && r as u32 <= width && 0 <= t && t < b && b as u32 <= height =>
+        {
+            let (w, h) = (width as f32, height as f32);
+            [l as f32 / w, t as f32 / h, r as f32 / w, b as f32 / h]
+        }
+        _ => [0.0, 0.0, 1.0, 1.0],
+    }
+}
+
+/// A plane's placement in pixels of an output of `size`, `[left, top,
+/// right, bottom]`: the whole output unless the title's fractions are a
+/// rectangle inside 0..1.
+fn placement(dest: Option<[f32; 4]>, (width, height): (u32, u32)) -> [f32; 4] {
+    let (w, h) = (width as f32, height as f32);
+    match dest {
+        Some([l, t, r, b])
+            if [l, t, r, b].iter().all(|v| v.is_finite())
+                && 0.0 <= l
+                && l < r
+                && r <= 1.0
+                && 0.0 <= t
+                && t < b
+                && b <= 1.0 =>
+        {
+            [l * w, t * h, r * w, b * h]
+        }
+        _ => [0.0, 0.0, w, h],
+    }
+}
+
+/// Records the composition of `planes` into `back` (in the present state;
+/// left as a render target), an output of `size` in `format`: cleared to
+/// black, the first plane drawn opaque, the later ones blended over it.
+/// Each plane goes from its state to the pixel-shader-readable one and
+/// back.
+#[allow(clippy::too_many_arguments)]
+fn record_compose(
+    device: &ID3D12Device,
+    host: &Host,
+    list: &ID3D12GraphicsCommandList,
+    back: &ID3D12Resource,
+    format: DXGI_FORMAT,
+    size: (u32, u32),
+    planes: &[Shown<'_>],
+    premultiplied: bool,
+) {
+    const READ: D3D12_RESOURCE_STATES = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+    let Some(pass) = compose_pass() else {
+        return;
+    };
+    let states: Vec<D3D12_RESOURCE_STATES> = planes.iter().map(|p| D3D12_RESOURCE_STATES(p.state as i32)).collect();
+    let mut barriers = vec![transition(back, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_RENDER_TARGET)];
+    let mut after = Vec::new();
+    for (p, &state) in planes.iter().zip(&states) {
+        if state != READ {
+            barriers.push(transition(p.texture, state, READ));
+            after.push(transition(p.texture, READ, state));
+        }
+    }
+    // SAFETY: an open list; our heap's slots; live resources; the pass's
+    // objects live as long as the process.
+    unsafe {
+        list.ResourceBarrier(&barriers);
+        let cleared = host.rtv(Some(back), None);
+        list.ClearRenderTargetView(cleared, &[0.0, 0.0, 0.0, 1.0], None);
+        list.SetDescriptorHeaps(&[Some(pass.views.clone())]);
+        list.SetGraphicsRootSignature(&pass.root);
+        list.IASetPrimitiveTopology(windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY(4));
+        for (i, p) in planes.iter().enumerate() {
+            let d = p.texture.GetDesc();
+            let Some(view_format) = view_format(d.Format) else {
+                continue;
+            };
+            let target = target_format(d.Format, format);
+            let blend = match (i, premultiplied) {
+                (0, _) => 0,
+                (_, false) => 1,
+                (_, true) => 2,
+            };
+            let Some(pipeline) = pass.pipeline(device, target, blend) else {
+                continue;
+            };
+            let slot = pass.next.fetch_add(1, Ordering::Relaxed) % COMPOSE_VIEWS;
+            let view = D3D12_SHADER_RESOURCE_VIEW_DESC {
+                Format: view_format,
+                ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
+                Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+                Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                    Texture2D: D3D12_TEX2D_SRV {
+                        MostDetailedMip: 0,
+                        MipLevels: 1,
+                        ..Default::default()
+                    },
+                },
+            };
+            device.CreateShaderResourceView(
+                p.texture,
+                Some(&view),
+                D3D12_CPU_DESCRIPTOR_HANDLE {
+                    ptr: pass.cpu + (slot * pass.step) as usize,
+                },
+            );
+            let rtv = D3D12_RENDER_TARGET_VIEW_DESC {
+                Format: target,
+                ViewDimension: D3D12_RTV_DIMENSION_TEXTURE2D,
+                ..Default::default()
+            };
+            let rtv = host.rtv(Some(back), Some(&rtv));
+            let source = source_fractions(p.src, d.Width as u32, d.Height);
+            let [l, t, r, b] = placement(p.dest, size);
+            list.SetPipelineState(&pipeline);
+            list.SetGraphicsRootDescriptorTable(
+                0,
+                D3D12_GPU_DESCRIPTOR_HANDLE {
+                    ptr: pass.gpu + u64::from(slot * pass.step),
+                },
+            );
+            list.SetGraphicsRoot32BitConstants(1, 4, source.as_ptr().cast(), 0);
+            list.OMSetRenderTargets(1, Some(&rtv), false, None);
+            list.RSSetViewports(&[D3D12_VIEWPORT {
+                TopLeftX: l,
+                TopLeftY: t,
+                Width: r - l,
+                Height: b - t,
+                MinDepth: 0.0,
+                MaxDepth: 1.0,
+            }]);
+            list.RSSetScissorRects(&[RECT {
+                left: l as i32,
+                top: t as i32,
+                right: r.ceil() as i32,
+                bottom: b.ceil() as i32,
+            }]);
+            list.DrawInstanced(3, 1, 0, 0);
+        }
+        if !after.is_empty() {
+            list.ResourceBarrier(&after);
+        }
+    }
+}
+
+#[cfg(test)]
+mod compose_tests {
+    use super::*;
+
+    #[test]
+    fn rectangles_outside_are_the_whole_surface() {
+        assert_eq!(source_fractions(None, 100, 50), [0.0, 0.0, 1.0, 1.0]);
+        assert_eq!(source_fractions(Some([0, 0, 200, 50]), 100, 50), [0.0, 0.0, 1.0, 1.0]);
+        assert_eq!(source_fractions(Some([50, 0, 100, 25]), 100, 50), [0.5, 0.0, 1.0, 0.5]);
+        assert_eq!(placement(None, (10, 20)), [0.0, 0.0, 10.0, 20.0]);
+        assert_eq!(placement(Some([0.0, 0.0, 0.5, 1.0]), (10, 20)), [0.0, 0.0, 5.0, 20.0]);
+        assert_eq!(placement(Some([f32::NAN, 0.0, 0.5, 1.0]), (10, 20)), [0.0, 0.0, 10.0, 20.0]);
+        assert_eq!(placement(Some([0.0, 0.0, 2.0, 1.0]), (10, 20)), [0.0, 0.0, 10.0, 20.0]);
+    }
+
+    #[test]
+    fn planes_are_read_and_drawn_as_stored() {
+        assert_eq!(view_format(DXGI_FORMAT(27)), Some(DXGI_FORMAT(28)));
+        assert_eq!(view_format(DXGI_FORMAT(30)), None);
+        assert_eq!(target_format(DXGI_FORMAT(29), DXGI_FORMAT_R8G8B8A8_UNORM), DXGI_FORMAT_R8G8B8A8_UNORM_SRGB);
+        assert_eq!(target_format(DXGI_FORMAT(28), DXGI_FORMAT_R8G8B8A8_UNORM), DXGI_FORMAT_R8G8B8A8_UNORM);
+    }
+}
 
 impl Host {
     /// Shows `texture`, which is in `state` (a host state) and stays in it,
@@ -9601,6 +10042,125 @@ impl Host {
             return None;
         };
         let (width, height) = (desc.Width as u32, desc.Height);
+        let state = D3D12_RESOURCE_STATES(state as i32);
+        self.show(width, height, format, frame, |list, back, _probe| {
+            // SAFETY: an open list, our back buffer and a live source.
+            unsafe {
+                list.ResourceBarrier(&[
+                    transition(texture, state, D3D12_RESOURCE_STATE_COPY_SOURCE),
+                    transition(
+                        back,
+                        D3D12_RESOURCE_STATE_PRESENT,
+                        D3D12_RESOURCE_STATE_COPY_DEST,
+                    ),
+                ]);
+                list.CopyResource(back, texture);
+                crate::fpsbox::draw(self, list, back, (width, height, format));
+                #[cfg(feature = "diagnostics")]
+                let seen = self.seen(list, texture, frame, _probe);
+                list.ResourceBarrier(&[
+                    transition(texture, D3D12_RESOURCE_STATE_COPY_SOURCE, state),
+                    transition(
+                        back,
+                        D3D12_RESOURCE_STATE_COPY_DEST,
+                        D3D12_RESOURCE_STATE_PRESENT,
+                    ),
+                ]);
+                #[cfg(feature = "diagnostics")]
+                return seen;
+            }
+        })
+    }
+
+    /// Shows several planes as frame `frame`: the largest sets the window's
+    /// size and format; each plane's source rectangle (else the whole
+    /// texture) is stretched to its placement (else the whole window), the
+    /// first opaque and each later one blended over what is there (straight
+    /// alpha, or premultiplied with `premultiplied`). Each plane is in its
+    /// `state` and stays in it. One plane: [`Host::present`], a plain copy.
+    /// If the planes cannot be composed, the largest is copied alone.
+    pub(crate) fn present_planes(&self, planes: &[Shown<'_>], premultiplied: bool, frame: u64) -> Option<bool> {
+        let size = |p: &Shown<'_>| {
+            // SAFETY: a live resource.
+            let d = unsafe { p.texture.GetDesc() };
+            (d.Width as u32, d.Height)
+        };
+        let largest = planes.iter().max_by_key(|p| {
+            let (w, h) = size(p);
+            u64::from(w) * u64::from(h)
+        })?;
+        if planes.len() == 1 {
+            return self.present(largest.texture, largest.state, frame);
+        }
+        // SAFETY: a live resource.
+        let largest_format = unsafe { largest.texture.GetDesc() }.Format;
+        let Some(format) = swap_format(largest_format) else {
+            tracing::warn!(format = largest_format.0, "cannot present this format");
+            return None;
+        };
+        let composable = compose_pass().is_some()
+            && planes.iter().all(|p| {
+                // SAFETY: a live resource.
+                let d = unsafe { p.texture.GetDesc() };
+                d.Flags.0 & 0x8 == 0
+                    && view_format(d.Format).is_some()
+                    && d.SampleDesc.Count == 1
+                    && d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D
+                    && d.DepthOrArraySize == 1
+            });
+        if !composable {
+            static ONCE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+            if !ONCE.swap(true, Ordering::Relaxed) {
+                tracing::warn!("present planes cannot be composed: the largest is shown alone");
+            }
+            return self.present(largest.texture, largest.state, frame);
+        }
+        let (width, height) = size(largest);
+        self.show(width, height, format, frame, |list, back, _probe| {
+            record_compose(&self.device, self, list, back, format, (width, height), planes, premultiplied);
+            // Diagnostics read the composed frame back: through the copy
+            // source state.
+            let after = if cfg!(feature = "diagnostics") {
+                D3D12_RESOURCE_STATE_COPY_SOURCE
+            } else {
+                D3D12_RESOURCE_STATE_PRESENT
+            };
+            // SAFETY: an open list and our back buffer.
+            unsafe {
+                list.ResourceBarrier(&[transition(back, D3D12_RESOURCE_STATE_RENDER_TARGET, after)]);
+                #[cfg(feature = "diagnostics")]
+                let seen = self.seen(list, back, frame, _probe);
+                #[cfg(feature = "diagnostics")]
+                list.ResourceBarrier(&[transition(back, after, D3D12_RESOURCE_STATE_PRESENT)]);
+                #[cfg(feature = "diagnostics")]
+                return seen;
+            }
+        })
+    }
+
+    /// Diagnostics: the read-back of a frame to save and the probe of its
+    /// blackness, of `texture` in the copy-source state.
+    #[cfg(feature = "diagnostics")]
+    fn seen(&self, list: &ID3D12GraphicsCommandList, texture: &ID3D12Resource, frame: u64, probe: bool) -> Seen {
+        let capture = crate::capture::wanted(frame)
+            .then(|| crate::capture::read_back(&self.device, list, texture))
+            .flatten();
+        let probe = if probe { crate::capture::probe(&self.device, list, texture) } else { None };
+        (capture, probe)
+    }
+
+    /// Shows a frame of `width` by `height` in `format`: the swap chain made
+    /// or resized to it, `record` given an open list and the back buffer (in
+    /// the present state, to leave in it) and whether it may probe, then the
+    /// list run and the buffer presented.
+    fn show(
+        &self,
+        width: u32,
+        height: u32,
+        format: DXGI_FORMAT,
+        frame: u64,
+        record: impl FnOnce(&ID3D12GraphicsCommandList, &ID3D12Resource, bool) -> Seen,
+    ) -> Option<bool> {
         let mut presenter = self.presenter.lock().unwrap_or_else(|e| e.into_inner());
         if presenter.is_none() {
             *presenter = match self.presenter(width, height, format) {
@@ -9638,8 +10198,7 @@ impl Host {
                 }
             }
         }
-        let state = D3D12_RESOURCE_STATES(state as i32);
-        // SAFETY: our swap chain, list and a live source texture.
+        // SAFETY: our swap chain and list.
         unsafe {
             let index = p.swap_chain.GetCurrentBackBufferIndex();
             let Ok(back) = p.swap_chain.GetBuffer::<ID3D12Resource>(index) else {
@@ -9668,35 +10227,13 @@ impl Host {
                 None => &p.copy,
             };
             copy.reset();
-            let list = &copy.list;
-            list.ResourceBarrier(&[
-                transition(texture, state, D3D12_RESOURCE_STATE_COPY_SOURCE),
-                transition(
-                    &back,
-                    D3D12_RESOURCE_STATE_PRESENT,
-                    D3D12_RESOURCE_STATE_COPY_DEST,
-                ),
-            ]);
-            list.CopyResource(&back, texture);
-            // The frame rate, into the corner of what is shown (not of the
-            // title's own frame, which the lines below read back).
-            crate::fpsbox::draw(self, list, &back, (width, height, format));
             #[cfg(feature = "diagnostics")]
-            let capture = crate::capture::wanted(frame)
-                .then(|| crate::capture::read_back(&self.device, list, texture))
-                .flatten();
-            #[cfg(feature = "diagnostics")]
-            let probe = if slot.is_some() { None } else { crate::capture::probe(&self.device, list, texture) };
+            let (capture, probe) = record(&copy.list, &back, slot.is_none());
             #[cfg(not(feature = "diagnostics"))]
-            let _ = frame;
-            list.ResourceBarrier(&[
-                transition(texture, D3D12_RESOURCE_STATE_COPY_SOURCE, state),
-                transition(
-                    &back,
-                    D3D12_RESOURCE_STATE_COPY_DEST,
-                    D3D12_RESOURCE_STATE_PRESENT,
-                ),
-            ]);
+            {
+                let _ = frame;
+                record(&copy.list, &back, slot.is_none());
+            }
             copy.close();
             match slot {
                 Some(i) => {
@@ -10153,7 +10690,16 @@ fn fault_in(va: u64, (start, bytes): (u64, u64)) -> String {
 /// device-removed data on).
 fn in_flight(history: &[D3D12_AUTO_BREADCRUMB_OP], markers: &[(u32, String)], done: usize) -> String {
     let barrier = |op: &D3D12_AUTO_BREADCRUMB_OP| *op == D3D12_AUTO_BREADCRUMB_OP_RESOURCEBARRIER;
-    let from = history[..done].iter().rposition(barrier).map_or(0, |b| b + 1);
+    // Stopped at a barrier: it waits for the work before the barriers
+    // just ahead of it (in one test run, a barrier behind a
+    // barrier, named nothing), so that work is shown.
+    let mut back = done;
+    if barrier(&history[done]) {
+        while back > 0 && barrier(&history[back - 1]) {
+            back -= 1;
+        }
+    }
+    let from = history[..back].iter().rposition(barrier).map_or(0, |b| b + 1);
     let to = history[done..]
         .iter()
         .position(barrier)
@@ -10163,7 +10709,7 @@ fn in_flight(history: &[D3D12_AUTO_BREADCRUMB_OP], markers: &[(u32, String)], do
     // From just before the command the GPU had not finished: the first
     // twelve after the barrier named draws long done when a list of 79
     // mesh draws stopped at its 45th (run 41).
-    for i in from.max(done.saturating_sub(4))..to {
+    for i in from.max(back.saturating_sub(4))..to {
         let op = history[i];
         if op == D3D12_AUTO_BREADCRUMB_OP_SETMARKER || shown == 12 {
             continue;

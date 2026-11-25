@@ -1645,6 +1645,7 @@ mod state {
     }
     pub(super) extern "system" fn dispatch(this: This, x: u32, y: u32, z: u32) {
         super::count_dispatch();
+        super::cut_for_work(this);
         with_state(this, |list, s| s.dispatch(list, x, y, z));
     }
     /// `DispatchMesh(x, y, z)` (the PC method of List6); the title's mesh
@@ -1762,6 +1763,9 @@ extern "system" fn execute_indirect(
         const DISPATCH: u32 = 2;
         const DISPATCH_SINGLE: u32 = 105;
         let kind = if *kind == DISPATCH_SINGLE { DISPATCH } else { *kind };
+        if kind == DISPATCH {
+            cut_for_work(this);
+        }
         with_state(this, |list, s| {
             ran = s.execute_indirect(list, (kind, stride, max), address, counter);
         });
@@ -2071,28 +2075,88 @@ fn value_written(this: This, address: u64, value: u64) {
         // SAFETY: the title passes one of our lists; a list is recorded by
         // one thread at a time and is not submitted while it records.
         let list = unsafe { &mut *this.cast_mut().cast::<List>() };
-        let Some(current) = list.host.as_ref() else {
-            return;
-        };
-        let Some(fresh) = fresh_list() else {
-            return;
-        };
-        current.close();
-        if let Some(done) = list.host.replace(fresh) {
-            // The part so far keeps its waits; nothing stands before the
-            // next one but this part itself.
-            let waits = std::mem::take(&mut list.gate);
-            list.earlier.push(Part { waits, host: done });
-        }
-        if let Some(host) = list.host.as_ref() {
-            list.state
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .replay(host);
-        }
+        cut_here(list);
     }
     #[cfg(not(windows))]
     let _ = (this, address, value);
+}
+
+/// Cuts `list`'s recording here without a wait: the host list so far is
+/// closed and kept as a part, keeping its waits; nothing stands before
+/// the next part but this one. What the title set goes on the new host
+/// list. `false` if there was nothing to cut or no new host list.
+#[cfg(windows)]
+fn cut_here(list: &mut List) -> bool {
+    let Some(current) = list.host.as_ref() else {
+        return false;
+    };
+    let Some(fresh) = fresh_list() else {
+        return false;
+    };
+    current.close();
+    if let Some(done) = list.host.replace(fresh) {
+        let waits = std::mem::take(&mut list.gate);
+        list.earlier.push(Part { waits, host: done });
+    }
+    if let Some(host) = list.host.as_ref() {
+        list.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .replay(host);
+    }
+    true
+}
+
+/// The most of the title's dispatches one host list holds before the
+/// recording is cut ([`cut_for_work`]); `0` cuts nothing.
+#[cfg(windows)]
+fn dispatches_per_part() -> u32 {
+    static MOST: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *MOST.get_or_init(|| {
+        std::env::var("VICTORY_CUT_DISPATCHES")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(32)
+    })
+}
+
+/// Before one of the title's dispatches (direct or indirect) on list
+/// `this`: with [`dispatches_per_part`] of them on its host list already,
+/// the recording is cut ([`cut_here`]), so that each part goes to the card
+/// in a submission of its own (`crate::host`'s `submit_each`). The system
+/// takes the card back only between submissions on this host (compute
+/// preemption at DMA-buffer boundaries), and one that runs past the
+/// timeout (2 s) resets the driver. A test run lost the device in the title's
+/// list of 182 indirect dispatches (1,149 host commands; it stopped at a
+/// barrier waiting for them, at 0.7-1.3 s of card time a frame); an earlier
+/// run in the same list. With waits cut into lists only (`crate::queue::cuts`).
+/// `VICTORY_CUT_DISPATCHES=<n>` sets the most per part (default 32), `0`
+/// cuts nothing, as before.
+#[cfg(windows)]
+fn cut_for_work(this: This) {
+    let most = dispatches_per_part();
+    if most == 0 || this.is_null() || !crate::queue::cuts() {
+        return;
+    }
+    // SAFETY: the title passes one of our lists; a list is recorded by one
+    // thread at a time and is not submitted while it records.
+    let list = unsafe { &mut *this.cast_mut().cast::<List>() };
+    let Some(current) = list.host.as_ref() else {
+        return;
+    };
+    if current.dispatches() >= most && cut_here(list) {
+        static CUTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        if CUTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 4 {
+            tracing::info!(
+                most,
+                parts = list.earlier.len() + 1,
+                "a list is cut after so many dispatches (VICTORY_CUT_DISPATCHES), each part a submission of its own"
+            );
+        }
+    }
+    if let Some(current) = list.host.as_ref() {
+        current.count_dispatch();
+    }
 }
 
 fn defer_write(this: This, address: u64, what: Written, bytes: usize) {
