@@ -66,15 +66,11 @@ unsafe impl Sync for Staging {}
 
 static STAGING: Mutex<Option<HashMap<usize, Arc<Staging>>>> = Mutex::new(None);
 
-/// Textures the host GPU wrote by a copy or resolve: their contents are on
-/// the host, not in title memory, which stays as it was.
-static HOST_WRITTEN: Mutex<Option<std::collections::HashSet<usize>>> = Mutex::new(None);
-
-/// A host copy or resolve writes `resource`.
-pub(crate) fn host_written(resource: This) {
-    let mut set = HOST_WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
-    set.get_or_insert_with(Default::default)
-        .insert(resource as usize);
+/// A copy or resolve in `list` writes `resource` on the GPU.
+pub(crate) fn host_written(list: &HostList, resource: This) {
+    if let Some(copy) = crate::resource::host_copy(resource) {
+        list.texture_write(&copy);
+    }
 }
 
 /// The title released a resource.
@@ -82,10 +78,6 @@ pub(crate) fn forget(resource: usize) {
     let mut map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(map) = map.as_mut() {
         map.remove(&resource);
-    }
-    let mut set = HOST_WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(set) = set.as_mut() {
-        set.remove(&resource);
     }
 }
 
@@ -100,21 +92,14 @@ pub(crate) fn title_written(texture: &ID3D12Resource) -> bool {
 /// Prepares a title-written texture for the list's first use. The prelude
 /// copies refreshed staging into the host texture before that use.
 pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) {
-    let host_written = HOST_WRITTEN
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .as_ref()
-        .is_some_and(|set| set.contains(&(resource as usize)));
-    // shortcut: a texture the host copied into keeps the host's contents
-    // even if the title later writes its memory too.
-    if host_written || !list.first_use(resource as usize) {
-        return;
-    }
-    let Some(staging) = staging(resource, texture) else {
+    let Some(copy) = crate::resource::host_copy(resource) else {
         return;
     };
-    if let Some(copy) = crate::resource::host_copy(resource) {
-        #[cfg(feature = "diagnostics")]
+    let upload = list.texture_read(&copy, || staging(resource, texture));
+    #[cfg(not(feature = "diagnostics"))]
+    let _ = upload;
+    #[cfg(feature = "diagnostics")]
+    if let Some(staging) = upload {
         for (i, footprint) in staging.footprints.iter().enumerate() {
             let f = footprint.Footprint;
             // SAFETY: live resources.
@@ -141,7 +126,6 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
                 (gpu + footprint.Offset, len),
             );
         }
-        list.defer_texture_upload(&copy, staging);
     }
 }
 
