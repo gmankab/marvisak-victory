@@ -1097,6 +1097,15 @@ mod tests {
     }
 
     #[test]
+    fn card_fetch_pipeline_builds() {
+        let Some(host) = host() else {
+            eprintln!("skipping the card fetch pipeline test: no D3D12 device");
+            return;
+        };
+        host.make_card_inflight(1 << 20).expect("create the in-flight card fetch pipeline");
+    }
+
+    #[test]
     fn the_caption_ends_with_how_long_the_process_has_run() {
         use super::{Duration, caption};
 
@@ -4929,28 +4938,8 @@ impl Host {
     /// [`CardInflight`] for `results` bytes of the compare's results; `None`
     /// (and the old fetch) if the shader or the memory cannot be had.
     fn make_card_inflight(&self, results: u64) -> Option<CardInflight> {
-        use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
-        use windows::Win32::Graphics::Direct3D::ID3DBlob;
         let made = (|| -> windows::core::Result<CardInflight> {
-            let mut code: Option<ID3DBlob> = None;
-            // SAFETY: the source and names live through the call; the out
-            // pointer is ours.
-            unsafe {
-                D3DCompile(
-                    CARD_FETCH.as_ptr().cast(),
-                    CARD_FETCH.len(),
-                    windows::core::s!("card fetch in flight"),
-                    None,
-                    None,
-                    windows::core::s!("main"),
-                    windows::core::s!("cs_5_1"),
-                    0,
-                    0,
-                    &mut code,
-                    None,
-                )?;
-            }
-            let code = code.ok_or_else(windows::core::Error::empty)?;
+            let bytes = compile(CARD_FETCH, "main", "cs_5_1")?;
             let slots = inflight_slots(inflight_fetch_bytes());
             let (table, table_data) = self.shared_buffer(4 + results).ok_or_else(windows::core::Error::empty)?;
             name(&table, || "card fetch in flight: tickets".into());
@@ -4960,11 +4949,9 @@ impl Host {
             // SAFETY: the mapping holds the counter; nothing of ours ran
             // on the card with it yet.
             unsafe { table_data.cast::<u32>().write_volatile(0) };
-            // SAFETY: the blob's own bytes; the root signature is inside
-            // the shader.
+            // SAFETY: the shader bytecode includes the root signature.
             unsafe {
-                let bytes = std::slice::from_raw_parts(code.GetBufferPointer().cast::<u8>(), code.GetBufferSize());
-                let root: ID3D12RootSignature = self.device.CreateRootSignature(0, bytes)?;
+                let root: ID3D12RootSignature = self.device.CreateRootSignature(0, &bytes)?;
                 let pso: ID3D12PipelineState = self.device.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
                     pRootSignature: std::mem::transmute_copy(&root),
                     CS: D3D12_SHADER_BYTECODE {
