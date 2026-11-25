@@ -9738,10 +9738,9 @@ fn compose_pass() -> Option<&'static ComposePass> {
     static PASS: OnceLock<Option<ComposePass>> = OnceLock::new();
     PASS.get_or_init(|| {
         let made = || -> windows::core::Result<ComposePass> {
-            use windows::core::s;
             let host = host().ok_or_else(windows::core::Error::empty)?;
-            let vs = compile(COMPOSE, s!("corner"), s!("vs_5_1"))?;
-            let ps = compile(COMPOSE, s!("compose"), s!("ps_5_1"))?;
+            let vs = compile(COMPOSE, "corner", "vs_5_1")?;
+            let ps = compile(COMPOSE, "compose", "ps_5_1")?;
             let kind = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
             let range = D3D12_DESCRIPTOR_RANGE {
                 RangeType: D3D12_DESCRIPTOR_RANGE_TYPE_SRV,

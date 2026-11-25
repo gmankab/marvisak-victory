@@ -248,9 +248,8 @@ fn pass() -> Option<&'static Pass> {
     static PASS: OnceLock<Option<Pass>> = OnceLock::new();
     PASS.get_or_init(|| {
         let made = || -> windows::core::Result<Pass> {
-            use windows::core::s;
             let host = crate::host::host().ok_or_else(windows::core::Error::empty)?;
-            let cs = crate::host::compile(STRETCH, s!("stretch"), s!("cs_5_1"))?;
+            let cs = crate::host::compile(STRETCH, "stretch", "cs_5_1")?;
             let kind = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
             let ranges = [D3D12_DESCRIPTOR_RANGE_TYPE_SRV, D3D12_DESCRIPTOR_RANGE_TYPE_UAV]
                 .map(|range_type| D3D12_DESCRIPTOR_RANGE {
@@ -308,7 +307,7 @@ fn pass() -> Option<&'static Pass> {
                     })
                 };
                 let pso = make(&cs[..])?;
-                let packing = crate::host::compile(STRETCH, s!("pack"), s!("cs_5_1"))?;
+                let packing = crate::host::compile(STRETCH, "pack", "cs_5_1")?;
                 let pso_pack = make(&packing[..])?;
                 let views: ID3D12DescriptorHeap = host.device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
                     Type: kind,
@@ -607,9 +606,8 @@ mod tests {
 
     #[test]
     fn the_stretch_compiles() {
-        use windows::core::s;
-        assert!(crate::host::compile(STRETCH, s!("stretch"), s!("cs_5_1")).is_ok());
-        assert!(crate::host::compile(STRETCH, s!("pack"), s!("cs_5_1")).is_ok());
+        assert!(crate::host::compile(STRETCH, "stretch", "cs_5_1").is_ok());
+        assert!(crate::host::compile(STRETCH, "pack", "cs_5_1").is_ok());
     }
 
     #[test]
