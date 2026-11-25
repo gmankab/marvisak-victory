@@ -258,7 +258,8 @@ fn make_pipeline(bytes: &[u8]) -> windows::core::Result<Clamp> {
 
 /// Records, in `list`, the clamp of `records` records of `kind` (PC
 /// argument numbering) `stride` bytes apart. The list's private buffer
-/// holds the snapped count (when present) and results until [`done`].
+/// holds the snapped count (when present) and stays readable until the
+/// next clamp writes it.
 /// Replaces the list's compute root signature and pipeline.
 pub(crate) fn bound(
     list: &HostList,
@@ -276,7 +277,6 @@ pub(crate) fn bound(
     let count_bytes = if count.is_some() { COUNT_BYTES } else { 0 };
     let bytes = (u64::from(stride) * u64::from(records.max(1))).checked_add(count_bytes)?;
     let bytes = u32::try_from(bytes).ok()?;
-    let out = list.arguments(u64::from(bytes))?;
     let sources = [Some(args.0), count.map(|(buffer, _)| buffer).filter(|&buffer| buffer != args.0)];
     let written = sources.map(|source| source.filter(|buffer| list.gpu_written(buffer)));
     // SAFETY: each buffer lives through this recording and its execution.
@@ -285,6 +285,7 @@ pub(crate) fn bound(
         Some((buffer, offset)) => unsafe { buffer.GetGPUVirtualAddress() }.checked_add(offset)?,
         None => gpu,
     };
+    let (out, before) = list.arguments(u64::from(bytes))?;
     let l = &list.list;
     let constants = [kind, stride, records, count_bytes as u32];
     let uav = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
@@ -295,7 +296,7 @@ pub(crate) fn bound(
         // Earlier shader writes (the title's argument passes) first.
         l.ResourceBarrier(&[
             uav_barrier(),
-            transition(&out, D3D12_RESOURCE_STATE_COMMON, uav),
+            transition(&out, before, uav),
         ]);
         for buffer in written.into_iter().flatten() {
             l.ResourceBarrier(&[transition(buffer, uav, read)]);
@@ -323,18 +324,6 @@ pub(crate) fn bound(
         }
     }
     Some(out)
-}
-
-/// Restore the private buffer to COMMON for the next clamp.
-pub(crate) fn done(list: &HostList, buffer: &ID3D12Resource) {
-    // SAFETY: an open list and a live buffer.
-    unsafe {
-        list.list.ResourceBarrier(&[transition(
-            buffer,
-            D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
-            D3D12_RESOURCE_STATE_COMMON,
-        )])
-    };
 }
 
 fn uav_barrier() -> D3D12_RESOURCE_BARRIER {
@@ -394,8 +383,6 @@ mod tests {
         };
         let output = bound(&list, (&input, 4), None, (1, 24, 2)).expect("clamp recorded");
         assert_ne!(output, input);
-        assert_eq!(output, list.arguments(48).unwrap());
-        done(&list, &output);
         list.close();
         host.execute(&[&list]);
 
@@ -426,7 +413,6 @@ mod tests {
             }
             let output = bound(&list, (&input, 0), None, (0, 16, draws.len() as u32))
                 .expect("clamp recorded");
-            done(&list, &output);
             list.close();
             host.execute(&[&list]);
             // SAFETY: the clamp completed and each mapping covers the inspected records.
@@ -460,12 +446,9 @@ mod tests {
         assert!(clamp_draws(&small).iter().all(|&vertices| vertices == 1));
     }
 
-    #[test]
-    fn argument_clamp_counted_dispatches_only_active_records() {
-        let Some(host) = host() else { return };
-        if cfg!(not(windows)) && std::env::var_os("VICTORY_DXCOMPILER").is_none() {
-            return;
-        }
+    /// An indirect dispatch increments the witness once, regardless of its
+    /// grid size or whether the driver overlaps it with another dispatch.
+    fn dispatch_witness(host: &crate::host::Host) -> (Clamp, ID3D12CommandSignature) {
         const WITNESS: &str = r#"
 RWByteAddressBuffer output : register(u0);
 [RootSignature("UAV(u0)")]
@@ -501,14 +484,41 @@ void main(uint3 group : SV_GroupID) {
                 &mut signature,
             ).unwrap();
         }
-        let signature = signature.unwrap();
+        (c, signature.unwrap())
+    }
+
+    fn record_witness(
+        list: &HostList,
+        (pipeline, signature): &(Clamp, ID3D12CommandSignature),
+        args: &ID3D12Resource,
+        (witness, offset): (&ID3D12Resource, u64),
+        count: u32,
+    ) {
+        // SAFETY: an open list; the arguments and count are in
+        // INDIRECT_ARGUMENT, and all resources live through execution.
+        unsafe {
+            let command = &list.list;
+            command.SetComputeRootSignature(&pipeline.root);
+            command.SetPipelineState(&pipeline.pso);
+            command.SetComputeRootUnorderedAccessView(0, witness.GetGPUVirtualAddress() + offset);
+            command.ExecuteIndirect(signature, count, args, COUNT_BYTES, Some(args), 0);
+        }
+    }
+
+    #[test]
+    fn argument_clamp_counted_dispatches_only_active_records() {
+        let Some(host) = host() else { return };
+        if cfg!(not(windows)) && std::env::var_os("VICTORY_DXCOMPILER").is_none() {
+            return;
+        }
+        let pipeline = dispatch_witness(host);
         for count in [0u32, 1, 7] {
             let title = [2u32, 1, 1, 3, 1, 1, count];
             let sentinel = [2u32, 1, 1, 1, 1, 1, 1];
             let (input, data) = host.shared_buffer(size_of_val(&title) as u64).unwrap();
             let (witness, witnessed) = host.shared_buffer(512).unwrap();
             let list = host.new_list().unwrap();
-            let output = list.arguments(size_of_val(&sentinel) as u64).unwrap();
+            let output = bound(&list, (&input, 0), Some((&input, 24)), (2, 12, 2)).unwrap();
             let mut mapped = std::ptr::null_mut();
             // SAFETY: the idle mappings cover all initialized words.
             unsafe {
@@ -517,22 +527,8 @@ void main(uint3 group : SV_GroupID) {
                 output.Map(0, None, Some(&mut mapped)).unwrap();
                 std::ptr::copy_nonoverlapping(sentinel.as_ptr(), mapped.cast::<u32>(), sentinel.len());
             }
-            let clamped = bound(&list, (&input, 0), Some((&input, 24)), (2, 12, 2)).unwrap();
-            assert_eq!(clamped, output);
 
-            // Each executed dispatch increments the same witness, even if
-            // the driver overlaps the commands in this ExecuteIndirect.
-            // SAFETY: all buffers live through execution. The private buffer
-            // is in INDIRECT_ARGUMENT and has distinct count and argument offsets.
-            unsafe {
-                let command = &list.list;
-                let witness = witness.GetGPUVirtualAddress();
-                command.SetComputeRootSignature(&c.root);
-                command.SetPipelineState(&c.pso);
-                command.SetComputeRootUnorderedAccessView(0, witness);
-                command.ExecuteIndirect(&signature, 2, &clamped, COUNT_BYTES, Some(&clamped), 0);
-            }
-            done(&list, &clamped);
+            record_witness(&list, &pipeline, &output, (&witness, 0), 2);
             list.close();
             host.execute(&[&list]);
 
@@ -549,5 +545,52 @@ void main(uint3 group : SV_GroupID) {
                 output.Unmap(0, None);
             }
         }
+    }
+
+    #[test]
+    fn argument_clamp_reuses_grows_and_replays_scratch() {
+        let Some(host) = host() else { return };
+        if cfg!(not(windows)) && std::env::var_os("VICTORY_DXCOMPILER").is_none() {
+            return;
+        }
+        const LARGE: u32 = 8192;
+        let count = u64::from(LARGE) * 12;
+        let (input, data) = host.shared_buffer(count + 8).unwrap();
+        let (witness, witnessed) = host.shared_buffer(768).unwrap();
+        // SAFETY: both mappings are idle and cover the initialized words.
+        unsafe {
+            std::ptr::copy_nonoverlapping([1u32; 3].as_ptr(), data.cast::<u32>(), 3);
+            data.add(count as usize).cast::<u32>().write(1);
+            data.add(count as usize + 4).cast::<u32>().write(0);
+            witnessed.write_bytes(0, 768);
+        }
+        let pipeline = dispatch_witness(host);
+        let list = host.new_list().unwrap();
+        let record = |max, counter, offset| {
+            let clamped = bound(&list, (&input, 0), Some((&input, counter)), (2, 12, max))
+                .expect("clamp recorded");
+            record_witness(&list, &pipeline, &clamped, (&witness, offset), max);
+            clamped
+        };
+        let first = record(1, count, 0);
+        let second = record(1, count + 4, 256);
+        assert_eq!(first, second);
+        let grown = record(LARGE, count, 512);
+        assert_ne!(second, grown);
+        drop((first, second));
+        list.close();
+        let check = |expected| {
+            host.execute(&[&list]);
+            // SAFETY: the list finished and the witness mapping is live.
+            let observed = [0, 256, 512].map(|i| unsafe { witnessed.add(i).cast::<u32>().read() });
+            assert_eq!(observed, expected);
+        };
+        check([128, 0, 128]);
+        check([256, 0, 256]);
+
+        list.reset();
+        assert_eq!(record(1, count, 0), grown);
+        list.close();
+        check([384, 0, 256]);
     }
 }
