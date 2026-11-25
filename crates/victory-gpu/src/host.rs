@@ -479,7 +479,16 @@ enum Step {
     GpuWrite(std::sync::Arc<crate::shadow::Shadow>, usize, usize),
     /// Brings a texture's staging buffer up to date: once per submission,
     /// whichever lists sample it, until a `Copy` or `Run` intervenes.
-    Texture(std::sync::Arc<crate::texture::Staging>),
+    Texture(
+        std::sync::Arc<crate::resource::HostTexture>,
+        std::sync::Arc<crate::texture::Staging>,
+    ),
+}
+
+#[derive(Default)]
+struct TextureUse {
+    upload: Option<std::sync::Arc<crate::texture::Staging>>,
+    writes: bool,
 }
 
 /// What a list does on the CPU when it is submitted: copies between host
@@ -497,10 +506,8 @@ struct Deferred {
     /// Buffer ranges refreshed since the last title copy (host copy,
     /// address, bytes): refreshing them again would find the same bytes.
     refreshed: std::collections::HashSet<(usize, usize, usize)>,
-    /// Textures whose contents the list brings up to date.
-    textures: std::collections::HashSet<usize>,
-    /// Staging for host textures that this list may upload before first use.
-    texture_uploads: std::collections::HashMap<usize, std::sync::Arc<crate::texture::Staging>>,
+    /// Which textures this list starts from title memory or writes on the GPU.
+    texture_uses: std::collections::HashMap<usize, TextureUse>,
     /// Host buffers that earlier shaders in this list used as UAVs.
     gpu_written: std::collections::HashSet<usize>,
     /// Bottom-of-pipe writes, done once the list has run: address, what,
@@ -1083,7 +1090,9 @@ impl HostList {
         for (key, (first, last, copy)) in states.iter() {
             let first = D3D12_RESOURCE_STATES(*first as i32);
             let real = D3D12_RESOURCE_STATES(copy.state.swap(*last, Ordering::Relaxed) as i32);
-            let before_first = if let Some(staging) = deferred.texture_uploads.get(key)
+            let usage = deferred.texture_uses.get(key);
+            let before_first = if let Some(staging) = usage.and_then(|usage| usage.upload.as_ref())
+                && !copy.host_written.load(Ordering::Relaxed)
                 && staging.needs_upload()
             {
                 let copy_dest = D3D12_RESOURCE_STATE_COPY_DEST;
@@ -1097,6 +1106,9 @@ impl HostList {
             };
             if before_first != first {
                 barriers.push(transition(&copy.texture, before_first, first));
+            }
+            if usage.is_some_and(|usage| usage.writes) {
+                copy.host_written.store(true, Ordering::Relaxed);
             }
         }
         if barriers.is_empty() && uploads.is_empty() {
@@ -1324,12 +1336,6 @@ impl HostList {
         }
     }
 
-    /// Whether this is the first time since the reset that the list asks
-    /// about `key` (a texture to bring up to date).
-    pub(crate) fn first_use(&self, key: usize) -> bool {
-        self.deferred().textures.insert(key)
-    }
-
     /// Runs `work` when the list is submitted, in order with its copies.
     /// `work` may write title memory (refreshes after it copy again).
     pub(crate) fn defer(&self, work: impl Fn() + Send + 'static) {
@@ -1342,16 +1348,37 @@ impl HostList {
         self.deferred().copies.push(Step::Host(Box::new(work)));
     }
 
-    /// Refreshes staging at submission and uploads it in the prelude if
-    /// needed. The caller records the texture's intended first state.
-    pub(crate) fn defer_texture_upload(
+    /// A first read (or partial write) may need the initial title contents.
+    /// A prior write in this list already provides them.
+    pub(crate) fn texture_read(
         &self,
         copy: &std::sync::Arc<crate::resource::HostTexture>,
-        staging: std::sync::Arc<crate::texture::Staging>,
-    ) {
+        staging: impl FnOnce() -> Option<std::sync::Arc<crate::texture::Staging>>,
+    ) -> Option<std::sync::Arc<crate::texture::Staging>> {
+        if copy.host_written.load(Ordering::Relaxed) {
+            return None;
+        }
         let mut deferred = self.deferred();
-        deferred.copies.push(Step::Texture(staging.clone()));
-        deferred.texture_uploads.insert(std::sync::Arc::as_ptr(copy) as usize, staging);
+        let key = std::sync::Arc::as_ptr(copy) as usize;
+        let std::collections::hash_map::Entry::Vacant(entry) = deferred.texture_uses.entry(key)
+        else {
+            return None;
+        };
+        let upload = staging();
+        entry.insert(TextureUse {
+            upload: upload.clone(),
+            writes: false,
+        });
+        if let Some(staging) = &upload {
+            deferred.copies.push(Step::Texture(copy.clone(), staging.clone()));
+        }
+        upload
+    }
+
+    /// Makes a GPU write authoritative in submission order.
+    pub(crate) fn texture_write(&self, copy: &std::sync::Arc<crate::resource::HostTexture>) {
+        let key = std::sync::Arc::as_ptr(copy) as usize;
+        self.deferred().texture_uses.entry(key).or_default().writes = true;
     }
 
     /// Runs the list's submission-time steps; refreshes go into `batch`
@@ -1409,8 +1436,8 @@ impl HostList {
                     shadow.writing(*address, *len);
                     continue;
                 }
-                Step::Texture(staging) => {
-                    if batch.texture_due(staging) {
+                Step::Texture(copy, staging) => {
+                    if !copy.host_written.load(Ordering::Relaxed) && batch.texture_due(staging) {
                         staging.refresh();
                     }
                     continue;
