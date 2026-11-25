@@ -1061,7 +1061,7 @@ const HOLES_A_LOOK: usize = 16;
 /// guard and leaves the protection.
 fn look_at_holes(most: usize) {
     static FROM: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-    let Some(_still) = title_memory_reading_now() else {
+    let Some(_still) = title_memory_reading_now(0, usize::MAX) else {
         return;
     };
     let part: Vec<usize> = {
