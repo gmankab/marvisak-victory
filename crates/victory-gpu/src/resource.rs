@@ -3145,6 +3145,39 @@ mod tests {
     /// A 4x4 texture filled from a title buffer through our list and queue,
     /// then read back from the host GPU.
     #[cfg(windows)]
+    #[cfg(feature = "diagnostics")]
+    #[test]
+    fn host_callback_sees_the_preceding_texture_refresh() {
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        let null = std::ptr::null();
+        let mut image = null;
+        let desc = texture(32, 32, 28, 1);
+        assert_eq!(
+            create_committed(null, &PROPERTIES, 0, &desc, 0, null.cast(), &RESOURCE_IIDS[0], &mut image),
+            S_OK
+        );
+        let (data, _) = texture_memory(image).unwrap();
+        // SAFETY: this test owns the committed image and has not submitted work yet.
+        unsafe { data.cast_mut().write(0x5a) };
+        let list = host.new_list().unwrap();
+        crate::texture::upload(&list, image, host_resource(image).unwrap());
+        let address = image as usize;
+        let observed = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let result = observed.clone();
+        list.defer_host(move || {
+            *result.lock().unwrap() = crate::texture::staged_state(address as This);
+        });
+        list.close();
+        host.execute(&[&list]);
+        // The upload clears the dirty flag, then detiling sets it for the next upload.
+        let expected = crate::texture::staged_state(image);
+        assert_eq!(slot::<Release>(image, 0x10)(image), 0);
+        assert_eq!(expected, Some((true, true)));
+        assert_eq!(*observed.lock().unwrap(), expected);
+    }
+
     #[test]
     fn buffer_data_reaches_the_host_texture() {
         use windows::Win32::Graphics::Direct3D12::*;
