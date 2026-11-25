@@ -1095,7 +1095,7 @@ impl Staging {
     }
 
     /// Returns the bytes of title memory read.
-    fn refresh_now(&self) -> usize {
+    pub(crate) fn refresh_now(&self) -> usize {
         let whole = std::time::Instant::now();
         let read = self.refresh_timed();
         let us = whole.elapsed().as_micros() as u64;

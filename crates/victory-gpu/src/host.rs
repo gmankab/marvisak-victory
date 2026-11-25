@@ -8755,15 +8755,20 @@ impl Batch {
             }
             _ => {
                 let started = std::time::Instant::now();
-                let before = PREPARING[2].load(Ordering::Relaxed);
                 let jobs: Vec<Box<dyn FnOnce() + Send>> = self
                     .textures_due
                     .drain(..)
-                    .map(|staging| Box::new(move || staging.refresh()) as Box<dyn FnOnce() + Send>)
+                    .map(|staging| {
+                        Box::new(move || {
+                            let bytes = staging.refresh_now();
+                            PREPARING[3].fetch_add(bytes as u64, Ordering::Relaxed);
+                        }) as Box<dyn FnOnce() + Send>
+                    })
                     .collect();
                 crate::shadow::wide_run(jobs);
-                let summed = PREPARING[2].load(Ordering::Relaxed).saturating_sub(before);
-                PREPARING[2].fetch_sub(summed.saturating_sub(started.elapsed().as_micros() as u64), Ordering::Relaxed);
+                // A present can drain the counters while the workers run.
+                // Publish the elapsed time once, when the batch is done.
+                PREPARING[2].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
             }
         }
     }
