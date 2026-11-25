@@ -201,12 +201,7 @@ fn main() -> Result<()> {
             translate::run(paths, validate, pipelines, list, jobs)
         }
         #[cfg(windows)]
-        Command::Precompile { files, jobs, limit } => {
-            if victory_shader::emit::portable_heap() {
-                victory_shader::emit::set_view_heap_limit(999_999);
-            }
-            precompile::run(&files, usize::from(jobs), limit)
-        }
+        Command::Precompile { files, jobs, limit } => precompile::run(&files, usize::from(jobs), limit),
         #[cfg(windows)]
         Command::Warm { paths, jobs, no_pipelines } => translate::warm_title(paths, jobs, !no_pipelines),
         Command::Run {

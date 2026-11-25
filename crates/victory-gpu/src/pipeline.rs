@@ -124,6 +124,14 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
         .clone()
 }
 
+/// Detects the same shader capabilities an executing title uses before
+/// an offline warm-up starts writing translations.
+#[cfg(windows)]
+pub fn prepare_shader_warmup() {
+    let _ = crate::host::host();
+    crate::descriptor::host::probe_view_limit();
+}
+
 /// Puts the translation of a container of the title's into the cache on
 /// disk, and with `compute` its host pipeline into the driver's, before any
 /// run wants them. Whether it translated, and whether it has a pipeline

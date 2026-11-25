@@ -392,6 +392,7 @@ pub fn run(
 pub fn warm_title(paths: Vec<PathBuf>, jobs: Option<usize>, pipelines: bool) -> Result<()> {
     let paths = crate::default_paths(paths)?;
     let cfg = victory_core::Config::load()?;
+    victory_hle::modules::d3d12x::prepare_shader_warmup();
     victory_hle::modules::d3d12x::use_shader_cache(cfg.cache_subdir("shaders")?);
     let threads = jobs.unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get()));
     let seen = Mutex::new(HashSet::new());

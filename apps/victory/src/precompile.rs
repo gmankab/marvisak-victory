@@ -6,7 +6,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 
 use anyhow::{Context, Result, ensure};
-use victory_hle::modules::d3d12x::{cache_shader, shader_cache_counts, use_shader_cache};
+use victory_hle::modules::d3d12x::{cache_shader, prepare_shader_warmup, shader_cache_counts, use_shader_cache};
 use victory_shader::Container;
 
 use crate::shader::{MAX_FILE, Source, sources};
@@ -14,6 +14,7 @@ use crate::shader::{MAX_FILE, Source, sources};
 pub fn run(files: &[PathBuf], workers: usize, limit: Option<usize>) -> Result<()> {
     let cache = victory_core::Config::load()?.cache_subdir("shaders")?;
     println!("Shader cache: {}", cache.display());
+    prepare_shader_warmup();
     use_shader_cache(cache);
     let seen = Mutex::new(HashSet::new());
     let errors = Mutex::new(Vec::new());

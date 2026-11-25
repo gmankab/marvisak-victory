@@ -66,7 +66,7 @@ pub fn use_shader_cache(dir: std::path::PathBuf) {
 }
 
 #[cfg(windows)]
-pub use victory_gpu::pipeline::{save_pipeline_cache, warm};
+pub use victory_gpu::pipeline::{prepare_shader_warmup, save_pipeline_cache, warm};
 
 pub(crate) fn module() -> HleModule {
     HleModule {
