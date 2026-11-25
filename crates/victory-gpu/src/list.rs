@@ -1164,7 +1164,7 @@ fn read_back(
         list.list
             .CopyTextureRegion((&raw const to).cast(), 0, 0, 0, (&raw const from).cast(), host_box)
     };
-    list.defer_read_back(buffer, data, [row as usize, rows as usize, pitch as usize]);
+    list.defer_read_back(buffer, data, [row as usize, rows as usize, pitch as usize], src.resource);
     Ok(())
 }
 

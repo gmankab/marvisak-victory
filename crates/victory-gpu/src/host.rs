@@ -5,6 +5,7 @@
 //! (unless `VICTORY_LATE_WAIT=1`, see [`late`]);
 //! overlap them with per-submission fences once more than clears run.
 
+use std::time::{Duration, Instant};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Mutex, OnceLock};
 
@@ -839,7 +840,7 @@ fn create() -> windows::core::Result<Host> {
         // Diagnostics: the software adapter, on which a shader's wild access
         // is an access violation in this process (a crash report with the
         // address and instruction) instead of a GPU fault and driver reset.
-        if cfg!(feature = "diagnostics") && std::env::var_os("VICTORY_D3D12_WARP").is_some() {
+        if on_warp() {
             let adapter = warp_adapter()?;
             D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)?;
             tracing::info!("host device on the software adapter (WARP)");
@@ -934,6 +935,12 @@ fn create() -> windows::core::Result<Host> {
             adapter,
         })
     }
+}
+
+/// Whether the host device is the software adapter (WARP): diagnostics
+/// builds with `VICTORY_D3D12_WARP`.
+pub(crate) fn on_warp() -> bool {
+    cfg!(feature = "diagnostics") && std::env::var_os("VICTORY_D3D12_WARP").is_some()
 }
 
 /// DXGI may return hardware for `EnumWarpAdapter` (notably under Proton).
@@ -1079,6 +1086,41 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn card_compare_pipeline_builds() {
+        let Some(host) = host() else {
+            eprintln!("skipping the card compare pipeline test: no D3D12 device");
+            return;
+        };
+        host.make_card_work().expect("create the card compare pipeline");
+    }
+
+    #[test]
+    fn the_caption_ends_with_how_long_the_process_has_run() {
+        use super::{Duration, caption};
+
+        let figures = "ZSlayerHQ retail game | 1 fps 953.5 ms/frame | 1526 draws/frame";
+        let up = |secs| caption(figures, Duration::from_secs(secs));
+        assert_eq!(up(0), format!("{figures} | up 0:00"));
+        assert_eq!(up(59), format!("{figures} | up 0:59"));
+        assert_eq!(up(754), format!("{figures} | up 12:34"));
+        assert_eq!(up(3723), format!("{figures} | up 1:02:03"));
+    }
+
+    #[test]
+    fn the_running_time_counts_from_the_process_start_and_moves_on() {
+        use super::{Duration, process_age, process_uptime};
+
+        // The test process was created before this test ran, and not long ago.
+        let age = process_age().expect("the kernel's creation time");
+        assert!(age > Duration::ZERO && age < Duration::from_secs(3600), "{age:?}");
+        let first = process_uptime();
+        std::thread::sleep(Duration::from_millis(20));
+        let later = process_uptime();
+        assert!(first >= age, "{first:?} is before the process's age {age:?}");
+        assert!(later >= first + Duration::from_millis(20), "{first:?} then {later:?}");
+    }
 
     #[test]
     fn warp_adapter_accepts_only_software() {
@@ -2447,8 +2489,9 @@ struct Deferred {
     /// Textures read back (texture to buffer copies), done once the list
     /// has run: the host buffer the list copies the texels into, the title
     /// memory they go to, the bytes of a row, the rows, the title's row
-    /// pitch.
-    backs: Vec<(ID3D12Resource, usize, [usize; 3])>,
+    /// pitch; and, for the walls trace only, the title texture read and
+    /// the frame the copy was recorded in.
+    backs: Vec<(ID3D12Resource, usize, [usize; 3], usize, u64)>,
     /// Title textures of the kinds copied back ([`crate::texback`]) that
     /// the list's shaders write, copied when the list closes.
     back_wanted: Vec<crate::texback::Target>,
@@ -2462,6 +2505,10 @@ struct Deferred {
     /// indirect arguments; 0 if none. It stays readable until the next
     /// clamp into it ([`HostList::indirect_state`]).
     indirect_readable: usize,
+    /// Work once the list has run (diagnostics: what read-back buffers
+    /// hold, `HostList::defer_after`).
+    #[cfg(feature = "diagnostics")]
+    after: Vec<Box<dyn Fn() + Send>>,
 }
 
 impl Deferred {
@@ -4377,7 +4424,12 @@ fn read_backs(list: &HostList) {
     for back in &list.deferred().texture_backs {
         crate::texback::land(back);
     }
-    for (buffer, at, [row, rows, pitch]) in &list.deferred().backs {
+    #[cfg(feature = "diagnostics")]
+    for work in &list.deferred().after {
+        work();
+    }
+    for (buffer, at, [row, rows, pitch], source, recorded) in &list.deferred().backs {
+        let mut landed = false;
         let mut data = std::ptr::null_mut();
         // SAFETY: a read-back buffer of ours, written by the list that has
         // run; the title's destination holds every row (checked when the
@@ -4402,8 +4454,163 @@ fn read_backs(list: &HostList) {
                     );
                 }
                 buffer.Unmap(0, None);
+                landed = true;
             }
         }
+        let bytes = row * rows;
+        walls_landed(READ_BACK, *at, pitch * (rows - 1) + row, bytes, if landed { bytes } else { 0 }, *source, Some(*recorded));
+    }
+}
+
+/// The walls trace's kinds of what reaches title memory from the card.
+pub(crate) const READ_BACK: &str = "read-back";
+pub(crate) const CARD_COPY: &str = "card copy";
+pub(crate) const HOST_COPY: &str = "host copy";
+
+/// The walls trace: one line a frame of what the card wrote that reached
+/// title memory in it, each summed per kind and destination. It lists
+/// every read-back, with the title texture it copies and the frame it was
+/// recorded in, and every card copy merged back and host copy shaders
+/// changed (those compared and found unchanged only counted). It shows
+/// when the results of a pass the title's CPU reads, such as the depth
+/// pyramid it tests occlusion against, reach the title, against the
+/// frame its scissor rectangle first narrows. Logging only.
+pub(crate) fn walls_landed(kind: &'static str, at: usize, len: usize, bytes: usize, written: usize, source: usize, recorded: Option<u64>) {
+    if !walls_trace() {
+        return;
+    }
+    static LANDINGS: Mutex<Option<Landings>> = Mutex::new(None);
+    let line = LANDINGS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get_or_insert_with(Landings::default)
+        .add(crate::frame::current(), kind, at, len, bytes, written, source, recorded);
+    if let Some((frame, count, unchanged, landed)) = line {
+        tracing::info!(
+            frame,
+            count,
+            unchanged,
+            landed = ?landed,
+            "walls trace: what the card wrote reached title memory in this frame"
+        );
+    }
+}
+
+/// One frame's [`walls_landed`].
+#[derive(Default)]
+struct Landings {
+    frame: u64,
+    entries: std::collections::BTreeMap<(&'static str, usize), Landing>,
+    /// Copies compared and found unchanged.
+    unchanged: u64,
+}
+
+#[derive(Clone, Copy)]
+struct Landing {
+    len: usize,
+    count: u32,
+    bytes: u64,
+    written: u64,
+    source: usize,
+    /// The earliest frame one was recorded in, for read-backs.
+    recorded: Option<u64>,
+}
+
+impl Landings {
+    /// Notes one in `frame`; if it is the first of a new frame, the line of
+    /// the frame before: its number, its entries, how many were unchanged,
+    /// and the entries (at most 256).
+    #[allow(clippy::too_many_arguments)]
+    fn add(
+        &mut self,
+        frame: u64,
+        kind: &'static str,
+        at: usize,
+        len: usize,
+        bytes: usize,
+        written: usize,
+        source: usize,
+        recorded: Option<u64>,
+    ) -> Option<(u64, usize, u64, Vec<String>)> {
+        let line = if self.frame == frame { None } else { self.take() };
+        self.frame = frame;
+        if written == 0 && kind != READ_BACK {
+            self.unchanged += 1;
+            return line;
+        }
+        let e = self.entries.entry((kind, at)).or_insert(Landing {
+            len,
+            count: 0,
+            bytes: 0,
+            written: 0,
+            source,
+            recorded,
+        });
+        e.len = e.len.max(len);
+        e.count += 1;
+        e.bytes += bytes as u64;
+        e.written += written as u64;
+        e.recorded = match (e.recorded, recorded) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
+        line
+    }
+
+    /// The line of the frame noted so far, if anything was noted.
+    fn take(&mut self) -> Option<(u64, usize, u64, Vec<String>)> {
+        if self.entries.is_empty() && self.unchanged == 0 {
+            return None;
+        }
+        let landed = self
+            .entries
+            .iter()
+            .take(256)
+            .map(|((kind, at), l)| {
+                let mut s = format!("{kind} {at:#x}+{:#x}: x{}, {} bytes, {} written", l.len, l.count, l.bytes, l.written);
+                if l.source != 0 {
+                    s += &format!(", from {:#x}", l.source);
+                }
+                if let Some(r) = l.recorded {
+                    s += &format!(", recorded in frame {r}");
+                }
+                s
+            })
+            .collect();
+        let line = (self.frame, self.entries.len(), self.unchanged, landed);
+        self.entries.clear();
+        self.unchanged = 0;
+        Some(line)
+    }
+}
+
+#[cfg(test)]
+mod landings_tests {
+    use super::{CARD_COPY, HOST_COPY, Landings, READ_BACK};
+
+    /// A frame's line comes when the next frame's first landing does: read
+    /// backs summed per destination with their texture and the earliest
+    /// frame they were recorded in, a card copy merged back, and a host
+    /// copy found unchanged only counted.
+    #[test]
+    fn a_frames_landings_are_one_line_once_the_next_frame_begins() {
+        let mut l = Landings::default();
+        assert!(l.add(5, READ_BACK, 0x1000, 0x200, 0x100, 0x100, 0xabc, Some(4)).is_none());
+        assert!(l.add(5, READ_BACK, 0x1000, 0x200, 0x100, 0x100, 0xabc, Some(3)).is_none());
+        assert!(l.add(5, CARD_COPY, 0x2000, 0x40, 0x40, 0x10, 0, None).is_none());
+        assert!(l.add(5, HOST_COPY, 0x3000, 0x40, 0x40, 0, 0, None).is_none());
+        let (frame, count, unchanged, landed) = l.add(6, CARD_COPY, 0x2000, 0x40, 0x40, 0x40, 0, None).expect("frame 5's line");
+        assert_eq!((frame, count, unchanged), (5, 2, 1));
+        assert_eq!(
+            landed,
+            [
+                "card copy 0x2000+0x40: x1, 64 bytes, 16 written",
+                "read-back 0x1000+0x200: x2, 512 bytes, 512 written, from 0xabc, recorded in frame 3",
+            ]
+        );
+        // Frame 6 holds its own.
+        assert_eq!(l.take().map(|t| (t.0, t.1)), Some((6, 1)));
+        assert!(l.take().is_none());
     }
 }
 
@@ -4436,6 +4643,7 @@ fn hand_back(back: &[Declared]) {
         crate::copystat::add(crate::copystat::C::BackScanUs, scanning.elapsed().as_micros() as u64);
         for ((shadow, from, to), found) in work.iter().zip(found) {
             let written = shadow.copy_back_with(*from, to - from, Some(found));
+            walls_landed(HOST_COPY, *from, to - from, to - from, written, 0, None);
             copy_back(1, written as u64);
             #[cfg(feature = "diagnostics")]
             crate::copystat::compared(*from, to - from, written);
@@ -4468,6 +4676,7 @@ fn hand_back(back: &[Declared]) {
         }
         for (from, to) in spans {
             let written = shadow.copy_back(from, to - from);
+            walls_landed(HOST_COPY, from, to - from, to - from, written, 0, None);
             copy_back(1, written as u64);
             #[cfg(feature = "diagnostics")]
             crate::copystat::compared(from, to - from, written);
@@ -7742,8 +7951,16 @@ impl HostList {
     /// from `buffer` (rows 256-byte pitched, see `PlacedFootprint::host_rows`)
     /// to title memory at `dst`, pitched `pitch`. The buffer lives until
     /// the list is reset.
-    pub(crate) fn defer_read_back(&self, buffer: ID3D12Resource, dst: *mut u8, [row, rows, pitch]: [usize; 3]) {
-        self.deferred().backs.push((buffer, dst as usize, [row, rows, pitch]));
+    pub(crate) fn defer_read_back(&self, buffer: ID3D12Resource, dst: *mut u8, [row, rows, pitch]: [usize; 3], source: crate::object::This) {
+        let recorded = crate::frame::current();
+        self.deferred().backs.push((buffer, dst as usize, [row, rows, pitch], source as usize, recorded));
+    }
+
+    /// Runs `work` once the list has run, with its read-backs
+    /// (diagnostics: logging what a read-back buffer of ours holds).
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn defer_after(&self, work: impl Fn() + Send + 'static) {
+        self.deferred().after.push(Box::new(work));
     }
 
     /// Stores `what` (`bytes` of it) at `dst` once the list has run.
@@ -8884,6 +9101,110 @@ struct Presenter {
     meter: Meter,
 }
 
+/// The process's CPU time in microseconds, kernel and user.
+#[cfg(windows)]
+fn process_cpu_us() -> Option<u64> {
+    use windows_sys::Win32::Foundation::FILETIME;
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetProcessTimes};
+    // SAFETY: plain C structs, zero is a valid value for each.
+    let (mut creation, mut exit, mut kernel, mut user) = unsafe {
+        (
+            std::mem::zeroed::<FILETIME>(),
+            std::mem::zeroed::<FILETIME>(),
+            std::mem::zeroed::<FILETIME>(),
+            std::mem::zeroed::<FILETIME>(),
+        )
+    };
+    // SAFETY: the current-process pseudo handle and four writable FILETIMEs.
+    let ok = unsafe {
+        GetProcessTimes(
+            GetCurrentProcess(),
+            &mut creation,
+            &mut exit,
+            &mut kernel,
+            &mut user,
+        )
+    };
+    if ok == 0 {
+        return None;
+    }
+    let ticks = |f: FILETIME| (u64::from(f.dwHighDateTime) << 32) | u64::from(f.dwLowDateTime);
+    Some((ticks(kernel) + ticks(user)) / 10)
+}
+
+/// The process's working set in bytes.
+#[cfg(windows)]
+fn process_working_set() -> Option<u64> {
+    use windows_sys::Win32::System::ProcessStatus::{
+        GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS,
+    };
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    // SAFETY: a plain C struct, zero is a valid value.
+    let mut counters = unsafe { std::mem::zeroed::<PROCESS_MEMORY_COUNTERS>() };
+    // SAFETY: the current-process pseudo handle and a counter of the size passed.
+    let ok = unsafe {
+        GetProcessMemoryInfo(
+            GetCurrentProcess(),
+            &mut counters,
+            std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32,
+        )
+    };
+    (ok != 0).then_some(counters.WorkingSetSize as u64)
+}
+
+/// The machine's logical processors.
+#[cfg(windows)]
+fn logical_processors() -> u32 {
+    use windows_sys::Win32::System::SystemInformation::{GetSystemInfo, SYSTEM_INFO};
+    // SAFETY: the call fills the plain struct.
+    let mut info = unsafe { std::mem::zeroed::<SYSTEM_INFO>() };
+    // SAFETY: as above.
+    unsafe { GetSystemInfo(&mut info) };
+    info.dwNumberOfProcessors.max(1)
+}
+
+/// How long ago the kernel created this process.
+#[cfg(windows)]
+fn process_age() -> Option<Duration> {
+    use windows_sys::Win32::Foundation::FILETIME;
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetProcessTimes};
+    // A FILETIME counts 100 ns from 1601; the Unix epoch is this many later.
+    const UNIX_EPOCH_TICKS: u64 = 116_444_736_000_000_000;
+    // SAFETY: plain C structs, zero is a valid value for each.
+    let mut times = unsafe { std::mem::zeroed::<[FILETIME; 4]>() };
+    let [creation, exit, kernel, user] = &mut times;
+    // SAFETY: the current-process pseudo handle and four writable FILETIMEs.
+    if unsafe { GetProcessTimes(GetCurrentProcess(), creation, exit, kernel, user) } == 0 {
+        return None;
+    }
+    let ticks = (u64::from(creation.dwHighDateTime) << 32) | u64::from(creation.dwLowDateTime);
+    let created = Duration::from_nanos(ticks.checked_sub(UNIX_EPOCH_TICKS)?.checked_mul(100)?);
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .checked_sub(created)
+}
+
+/// How long the process has been running: its age when first asked, plus the
+/// time since, so the wall clock being set does not move it.
+fn process_uptime() -> Duration {
+    static FIRST: std::sync::OnceLock<(Instant, Duration)> = std::sync::OnceLock::new();
+    let (at, age) = *FIRST.get_or_init(|| (Instant::now(), process_age().unwrap_or_default()));
+    age + at.elapsed()
+}
+
+/// The window's caption: the meter's figures, then how long the process has
+/// run, as minutes and seconds, with hours once there are any.
+fn caption(figures: &str, up: Duration) -> String {
+    let s = up.as_secs();
+    let (h, m, s) = (s / 3600, s / 60 % 60, s % 60);
+    if h == 0 {
+        format!("{figures} | up {m}:{s:02}")
+    } else {
+        format!("{figures} | up {h}:{m:02}:{s:02}")
+    }
+}
+
 /// The frame rate, shown in the window's caption every second and logged
 /// every few seconds.
 struct Meter {
@@ -8893,8 +9214,14 @@ struct Meter {
     copy_stats_frames: u64,
     drawn: u64,
     logged: std::time::Instant,
-    /// The caption the window had, once read.
-    caption: Option<Vec<u16>>,
+    /// Process CPU time at the last report (microseconds).
+    cpu_us: u64,
+    /// Percent of the machine's CPU over the last report.
+    cpu_pct: f64,
+    /// Percent of the frame time the GPU was busy.
+    gpu_pct: f64,
+    /// Working set in MB.
+    ram_mb: f64,
 }
 
 impl Meter {
@@ -8907,7 +9234,10 @@ impl Meter {
             copy_stats_frames: 0,
             drawn: crate::draw::drawn(),
             logged: now,
-            caption: None,
+            cpu_us: process_cpu_us().unwrap_or(0),
+            cpu_pct: 0.0,
+            gpu_pct: 0.0,
+            ram_mb: 0.0,
         }
     }
 
@@ -8937,6 +9267,20 @@ impl Meter {
         let [cpu, gpu] = [0, 1].map(|i| {
             SUBMISSION_US[i].swap(0, Ordering::Relaxed) as f64 / 1000.0 / frames
         });
+        // Process CPU share of the whole machine, GPU busy share of the frame,
+        // and the process's working set.
+        self.cpu_pct = {
+            let now = process_cpu_us().unwrap_or(self.cpu_us);
+            let pct = (now.saturating_sub(self.cpu_us)) as f64
+                / 1e6
+                / elapsed.as_secs_f64()
+                / f64::from(logical_processors())
+                * 100.0;
+            self.cpu_us = now;
+            pct
+        };
+        self.gpu_pct = if ms > 0.0 { gpu / ms * 100.0 } else { 0.0 };
+        self.ram_mb = process_working_set().unwrap_or(0) as f64 / (1024.0 * 1024.0);
         let [copy_ms, copy_mb, texture_ms, texture_mb] = [0, 1, 2, 3].map(|i| {
             let scale = if i % 2 == 0 { 1e3 } else { 1e6 };
             PREPARING[i].swap(0, Ordering::Relaxed) as f64 / scale / frames
@@ -9079,6 +9423,12 @@ impl Meter {
             }
             crate::tiles::status();
             {
+                let [same, changed, waiting] =
+                    [0, 1, 2].map(|i| crate::draw::HEAP_TEXTURES_RECHECKED[i].load(Ordering::Relaxed));
+                tracing::info!(
+                    "textures picked by index, looked at again after their upload: {same} looks found them unchanged, \
+                     {changed} changed (uploaded again), {waiting} wait for a look"
+                );
                 let [queued, due, away, partly, oldest] =
                     [0, 1, 2, 3, 4].map(|i| crate::draw::HEAP_TEXTURES_QUEUE[i].load(Ordering::Relaxed));
                 let [same, parts, tails] =
@@ -9099,6 +9449,15 @@ impl Meter {
                     crate::descriptor::host::STALE[2].load(Ordering::Relaxed),
                     crate::descriptor::host::STALE[3].load(Ordering::Relaxed),
                     crate::descriptor::host::STALE[4].load(Ordering::Relaxed)
+                );
+                let [views, shown, waiting, tables, gone, own, free, start, other, shows, back] =
+                    [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10].map(|i: usize| crate::descriptor::host::SWEPT[i].load(Ordering::Relaxed));
+                tracing::info!(
+                    "placed texture views in the heap at the last look: {views}, of them {shown} shown, {waiting} in the queue, \
+                     {tables} read through tables, {gone} without memory; with memory and nothing to bring them up to date: \
+                     {own} of their own memory, {free} of memory no other view describes, {start} of memory another texture \
+                     begins at, {other} of another's memory ({shows} of all these show another view); {back} put back into the \
+                     queue since the start"
                 );
             }
             {
@@ -9147,7 +9506,8 @@ impl Meter {
                  dropped {dropped:.0} without a host pipeline ({making} being made) and \
                  {indirect:.0} indirect; heap buffers {picked:.1} passes {picked_ms:.1} ms;                  texture slots written so far: {placed} placed, {objects} of objects; \
                  textures picked by index: {picked_textures} uploaded so far ({picked_mb} MB), \
-                 {picked_waiting} waiting, {picked_away} passed over unmapped; depth textures with                  unordered access: {du0} made, bound as depth {du1}x, cleared as depth {du2}x,                  unordered views refused {du3}x; buffer views left null as the host would refuse them: {refused}",
+                 {picked_waiting} waiting, {picked_away} passed over unmapped; depth textures with                  unordered access: {du0} made, bound as depth {du1}x, cleared as depth {du2}x,                  unordered views refused {du3}x; buffer views left null as the host would refuse them: {refused}; \
+                 cpu {cpu_pct:.1}% gpu {gpu_pct:.0}% busy ram {ram_mb:.0} MB",
                 picked_textures = crate::draw::HEAP_TEXTURES.load(Ordering::Relaxed),
                 picked_mb = crate::draw::HEAP_TEXTURE_BYTES.load(Ordering::Relaxed) >> 20,
                 picked_waiting = crate::draw::HEAP_TEXTURES_WAITING.load(Ordering::Relaxed),
@@ -9166,7 +9526,10 @@ impl Meter {
                 ),
                 making = crate::pipeline::making(),
                 placed = crate::descriptor::host::PLACED_TEXTURE_SLOTS.load(Ordering::Relaxed),
-                objects = crate::descriptor::host::OBJECT_TEXTURE_SLOTS.load(Ordering::Relaxed)
+                objects = crate::descriptor::host::OBJECT_TEXTURE_SLOTS.load(Ordering::Relaxed),
+                cpu_pct = self.cpu_pct,
+                gpu_pct = self.gpu_pct,
+                ram_mb = self.ram_mb
             );
             #[cfg(feature = "diagnostics")]
             {
@@ -9179,52 +9542,53 @@ impl Meter {
                 }
             }
         }
-        if self.caption.is_none() {
-            // The window's own text, read without a message.
-            let mut buffer = vec![0u16; 512];
-            // SAFETY: a window handle and a buffer of that length.
-            let n = unsafe { InternalGetWindowText(hwnd, &mut buffer) };
-            buffer.truncate(n.max(0) as usize);
-            self.caption = Some(buffer);
-        }
-        let Some(caption) = &self.caption else { return };
-        let text = format!(" | VIctory {fps:.0} fps {ms:.1} ms/frame {draws:.0} draws/frame");
-        let mut text: Vec<u16> = caption.iter().copied().chain(text.encode_utf16()).collect();
-        text.push(0);
+        let (cpu_pct, gpu_pct, ram_mb) = (self.cpu_pct, self.gpu_pct, self.ram_mb);
+        let text = format!(
+            "ZSlayerHQ retail game | {fps:.0} fps {ms:.1} ms/frame | gpu {gpu_pct:.0}% busy \
+             cpu {cpu_pct:.0}% ram {ram_mb:.0} MB | {draws:.0} draws/frame"
+        );
         // Setting the text waits for the window's thread (a title thread,
         // which may not pump for a while), so a thread of ours does it and
-        // presenting never waits; it takes the newest text when free.
-        static PENDING: Mutex<Option<(usize, Vec<u16>)>> = Mutex::new(None);
+        // presenting never waits; it takes the newest figures when free, and
+        // keeps the running time moving while frames are slow or absent.
+        static PENDING: Mutex<Option<(usize, String)>> = Mutex::new(None);
         static SETTER: std::sync::Once = std::sync::Once::new();
         *PENDING.lock().unwrap_or_else(|e| e.into_inner()) = Some((hwnd.0 as usize, text));
         SETTER.call_once(|| {
             let _ = std::thread::Builder::new()
                 .name("victory-caption".into())
                 .spawn(|| {
+                    let (mut newest, mut shown) = (None, None);
                     loop {
                         let next = PENDING.lock().unwrap_or_else(|e| e.into_inner()).take();
-                        match next {
-                            // SAFETY: a window handle and a NUL-terminated text.
-                            Some((hwnd, text)) => unsafe {
-                                let hwnd = HWND(hwnd as *mut _);
-                                let style = GetWindowLongPtrW(hwnd, GWL_STYLE);
-                                let frame = (WS_CAPTION | WS_THICKFRAME).0 as isize;
-                                if style & frame != 0
-                                    && SetWindowLongPtrW(hwnd, GWL_STYLE, style & !frame) != 0
-                                {
-                                    let flags = SWP_FRAMECHANGED
-                                        | SWP_NOMOVE
-                                        | SWP_NOSIZE
-                                        | SWP_NOZORDER
-                                        | SWP_NOACTIVATE;
-                                    if SetWindowPos(hwnd, None, 0, 0, 0, 0, flags).is_err() {
-                                        SetWindowLongPtrW(hwnd, GWL_STYLE, style);
+                        newest = next.or(newest);
+                        if let Some((hwnd, figures)) = &newest {
+                            let text = caption(figures, process_uptime());
+                            if shown.as_ref().is_none_or(|(window, previous)| window != hwnd || previous != &text) {
+                                let wide: Vec<u16> = text.encode_utf16().chain([0]).collect();
+                                // SAFETY: a window handle and a NUL-terminated text.
+                                unsafe {
+                                    let window = HWND(*hwnd as *mut _);
+                                    let style = GetWindowLongPtrW(window, GWL_STYLE);
+                                    let frame = (WS_CAPTION | WS_THICKFRAME).0 as isize;
+                                    if style & frame != 0
+                                        && SetWindowLongPtrW(window, GWL_STYLE, style & !frame) != 0
+                                    {
+                                        let flags = SWP_FRAMECHANGED
+                                            | SWP_NOMOVE
+                                            | SWP_NOSIZE
+                                            | SWP_NOZORDER
+                                            | SWP_NOACTIVATE;
+                                        if SetWindowPos(window, None, 0, 0, 0, 0, flags).is_err() {
+                                            SetWindowLongPtrW(window, GWL_STYLE, style);
+                                        }
                                     }
+                                    let _ = SetWindowTextW(window, PCWSTR(wide.as_ptr()));
                                 }
-                                let _ = SetWindowTextW(hwnd, PCWSTR(text.as_ptr()));
-                            },
-                            None => std::thread::sleep(std::time::Duration::from_millis(100)),
+                                shown = Some((*hwnd, text));
+                            }
                         }
+                        std::thread::sleep(Duration::from_millis(100));
                     }
                 });
         });

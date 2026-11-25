@@ -3944,6 +3944,8 @@ impl Shadow {
         entry.1 += 1;
         entry.2 += fetched as u64;
         entry.3 += written as u64;
+        drop(seen);
+        crate::host::walls_landed(crate::host::CARD_COPY, self.start as usize, self.len as usize, fetched, written, 0, None);
     }
 
     /// After a submission, for a copy in the card's memory: `gpu` is what
