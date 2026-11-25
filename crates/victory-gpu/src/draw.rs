@@ -996,7 +996,13 @@ impl State {
             s.refresh(list, *at, 4);
         }
         // Bounded first: the clamp binds a compute pipeline of its own.
-        let Some(clamped) = crate::indirect::bound(list, args.gpu(arguments), (kind, stride, max)) else {
+        let count_source = counter.as_ref().map(|(s, at)| (&s.buffer, s.offset(*at)));
+        let Some(clamped) = crate::indirect::bound(
+            list,
+            (&args.buffer, args.offset(arguments)),
+            count_source,
+            (kind, stride, max),
+        ) else {
             why("argument clamp unavailable");
             return false;
         };
@@ -1034,9 +1040,9 @@ impl State {
                 &signature,
                 max,
                 &clamped,
+                if count_source.is_some() { crate::indirect::COUNT_BYTES } else { 0 },
+                count_source.map(|_| &clamped),
                 0,
-                counter.as_ref().map(|(s, _)| &s.buffer),
-                counter.as_ref().map_or(0, |(s, at)| s.offset(*at)),
             )
         };
         crate::indirect::done(list, &clamped);

@@ -501,6 +501,8 @@ struct Deferred {
     textures: std::collections::HashSet<usize>,
     /// Staging for host textures that this list may upload before first use.
     texture_uploads: std::collections::HashMap<usize, std::sync::Arc<crate::texture::Staging>>,
+    /// Host buffers that earlier shaders in this list used as UAVs.
+    gpu_written: std::collections::HashSet<usize>,
     /// Bottom-of-pipe writes, done once the list has run: address, what,
     /// bytes.
     writes: Vec<(usize, crate::queue::Written, usize)>,
@@ -1220,9 +1222,13 @@ impl HostList {
         address: usize,
         len: usize,
     ) {
-        self.deferred()
-            .copies
-            .push(Step::GpuWrite(shadow.clone(), address, len));
+        let mut deferred = self.deferred();
+        deferred.gpu_written.insert(shadow.buffer.as_raw() as usize);
+        deferred.copies.push(Step::GpuWrite(shadow.clone(), address, len));
+    }
+
+    pub(crate) fn gpu_written(&self, buffer: &ID3D12Resource) -> bool {
+        self.deferred().gpu_written.contains(&(buffer.as_raw() as usize))
     }
 
     /// Stores `what` (`bytes` of it) at `dst` once the list has run.
