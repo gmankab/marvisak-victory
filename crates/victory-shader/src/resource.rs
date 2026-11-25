@@ -417,6 +417,8 @@ struct Tracer<'a> {
     rpo: Vec<usize>,
     /// The block of the access being traced ([`Self::live`]).
     at: std::cell::Cell<Option<usize>>,
+    /// Address sums by SSA value, with a separate cache for first-lane indices.
+    sums: std::cell::RefCell<[Vec<Option<Sum>>; 2]>,
 }
 
 /// What lanes are known to satisfy: each [`Bool`] where its flag is set,
@@ -484,6 +486,7 @@ impl<'a> Tracer<'a> {
             meets: Default::default(),
             rpo,
             at: Default::default(),
+            sums: Default::default(),
         };
         t.origin = t.propagate_copies(n)?;
         Ok(t)
@@ -651,6 +654,11 @@ impl<'a> Tracer<'a> {
             }
             Term::Value(v) => v,
         };
+        let index = v.0 as usize;
+        let mode = usize::from(self.read_first_lane.get());
+        if let Some(&Some(sum)) = self.sums.borrow()[mode].get(index) {
+            return sum;
+        }
         let dynamic = Sum {
             base: None,
             offset: 0,
@@ -709,14 +717,25 @@ impl<'a> Tracer<'a> {
             return dynamic;
         };
         let (x, y) = (self.sum(a), self.sum(b));
-        if x.base.is_some() && y.base.is_some() || x.dynamic.is_some() && y.dynamic.is_some() {
-            return dynamic;
+        let sum =
+            if x.base.is_some() && y.base.is_some() || x.dynamic.is_some() && y.dynamic.is_some() {
+                dynamic
+            } else {
+                Sum {
+                    base: x.base.or(y.base),
+                    offset: x.offset.wrapping_add(y.offset),
+                    dynamic: x.dynamic.or(y.dynamic),
+                }
+            };
+        // The operands' origins are settled before tracing starts. Every
+        // use of this value can reuse its sum, including an opaque result.
+        let mut all_sums = self.sums.borrow_mut();
+        let sums = &mut all_sums[mode];
+        if index >= sums.len() {
+            sums.resize(index + 1, None);
         }
-        Sum {
-            base: x.base.or(y.base),
-            offset: x.offset.wrapping_add(y.offset),
-            dynamic: x.dynamic.or(y.dynamic),
-        }
+        sums[index] = Some(sum);
+        sum
     }
 
     /// For a join `v` whose every incoming value adds to an `s_getpc_b64` low
