@@ -6536,7 +6536,7 @@ impl Host {
         for list in runs {
             list.run_deferred(&mut batch);
             firsts.push(lists.len());
-            if let Some(prelude) = list.prelude() {
+            if let Some(prelude) = list.prelude(&mut batch) {
                 lists.push(Some(prelude));
             }
             lists.push(list.list.cast().ok());
@@ -7581,14 +7581,16 @@ impl HostList {
     /// title-written textures whose staging buffer was refreshed (or has
     /// not been uploaded yet) it copies the staging buffer into the host
     /// texture before the list uses it.
-    fn prelude(&self) -> Option<ID3D12CommandList> {
+    fn prelude(&self, batch: &mut Batch) -> Option<ID3D12CommandList> {
         const COPY_DEST: u32 = 0x400;
         const COPY_SOURCE: u32 = 0x800;
         let host_state = |state: u32| D3D12_RESOURCE_STATES(state as i32);
-        // `run_deferred` has already refreshed each staging buffer, so we
-        // know here exactly which textures need a GPU copy on this submission.
         let uploads: Vec<_> = {
             let deferred = self.deferred();
+            // The upload consumes the dirty flag set by the refresh.
+            if !deferred.texture_uploads.is_empty() {
+                batch.refresh_textures();
+            }
             deferred
                 .texture_uploads
                 .iter()

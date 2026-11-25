@@ -3171,11 +3171,12 @@ mod tests {
         });
         list.close();
         host.execute(&[&list]);
-        // The upload clears the dirty flag, then detiling sets it for the next upload.
-        let expected = crate::texture::staged_state(image);
+        let after = crate::texture::staged_state(image);
         assert_eq!(slot::<Release>(image, 0x10)(image), 0);
-        assert_eq!(expected, Some((true, true)));
-        assert_eq!(*observed.lock().unwrap(), expected);
+        // The callback observes the dirty staging buffer before the
+        // prelude uploads it.
+        assert_eq!(*observed.lock().unwrap(), Some((false, true)));
+        assert_eq!(after, Some((true, false)));
     }
 
     #[test]
