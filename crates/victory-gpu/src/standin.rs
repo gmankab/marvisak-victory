@@ -184,12 +184,10 @@ pub(crate) fn note_pair(input: (usize, Seen), output: (usize, Seen), mode: u32) 
 }
 
 const STRETCH: &str = r#"
-#define RS "DescriptorTable(SRV(t0), UAV(u0)), RootConstants(num32BitConstants = 4, b0), StaticSampler(s0, filter = FILTER_MIN_MAG_MIP_LINEAR, addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_CLAMP)"
 Texture2D<float4> input : register(t0);
 RWTexture2D<float4> output : register(u0);
 SamplerState clamped : register(s0);
 cbuffer Size : register(b0) { uint2 size; uint mode; uint unused; };
-[RootSignature(RS)]
 [numthreads(8, 8, 1)]
 void stretch(uint3 id : SV_DispatchThreadID) {
     if (id.x >= size.x || id.y >= size.y) return;
@@ -216,7 +214,6 @@ uint pack_rgb9e5(float3 c) {
     return v.r | (v.g << 9) | (v.b << 18) | ((uint)e << 27);
 }
 
-[RootSignature(RS)]
 [numthreads(8, 8, 1)]
 void pack(uint3 id : SV_DispatchThreadID) {
     if (id.x >= size.x || id.y >= size.y) return;
@@ -255,10 +252,51 @@ fn pass() -> Option<&'static Pass> {
             let host = crate::host::host().ok_or_else(windows::core::Error::empty)?;
             let cs = crate::host::compile(STRETCH, s!("stretch"), s!("cs_5_1"))?;
             let kind = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-            // SAFETY: the root signature is inside the shader; plain
-            // creation and queries; the description outlives the call.
+            let ranges = [D3D12_DESCRIPTOR_RANGE_TYPE_SRV, D3D12_DESCRIPTOR_RANGE_TYPE_UAV]
+                .map(|range_type| D3D12_DESCRIPTOR_RANGE {
+                    RangeType: range_type,
+                    NumDescriptors: 1,
+                    OffsetInDescriptorsFromTableStart: D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND,
+                    ..Default::default()
+                });
+            let params = [
+                D3D12_ROOT_PARAMETER {
+                    ParameterType: D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE,
+                    Anonymous: D3D12_ROOT_PARAMETER_0 {
+                        DescriptorTable: D3D12_ROOT_DESCRIPTOR_TABLE {
+                            NumDescriptorRanges: ranges.len() as u32,
+                            pDescriptorRanges: ranges.as_ptr(),
+                        },
+                    },
+                    ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+                },
+                D3D12_ROOT_PARAMETER {
+                    ParameterType: D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS,
+                    Anonymous: D3D12_ROOT_PARAMETER_0 {
+                        Constants: D3D12_ROOT_CONSTANTS {
+                            Num32BitValues: 4,
+                            ..Default::default()
+                        },
+                    },
+                    ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+                },
+            ];
+            let sampler = D3D12_STATIC_SAMPLER_DESC {
+                Filter: D3D12_FILTER_MIN_MAG_MIP_LINEAR,
+                AddressU: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+                AddressV: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+                AddressW: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+                MaxAnisotropy: 1,
+                ComparisonFunc: D3D12_COMPARISON_FUNC_NEVER,
+                MaxLOD: f32::MAX,
+                ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+                ..Default::default()
+            };
+            // SAFETY: the ranges and root inputs live through serialization,
+            // and the pipeline descriptor references live shader bytecode.
             unsafe {
-                let root: ID3D12RootSignature = host.device.CreateRootSignature(0, &cs[..])?;
+                let root =
+                    crate::host::root_signature_from_params(&host.device, &params, &[sampler])?;
                 let make = |code: &[u8]| -> windows::core::Result<ID3D12PipelineState> {
                     host.device.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
                         pRootSignature: std::mem::transmute_copy(&root),
@@ -572,6 +610,13 @@ mod tests {
         use windows::core::s;
         assert!(crate::host::compile(STRETCH, s!("stretch"), s!("cs_5_1")).is_ok());
         assert!(crate::host::compile(STRETCH, s!("pack"), s!("cs_5_1")).is_ok());
+    }
+
+    #[test]
+    fn both_upscaler_pipelines_are_created_on_the_host_device() {
+        if crate::host::host().is_some() {
+            assert!(pass().is_some(), "create both FSR stand-in pipelines");
+        }
     }
 
     #[test]
