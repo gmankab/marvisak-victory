@@ -86,7 +86,7 @@ const NAMES: [&str; 9] = [
 ];
 const CLOSE: usize = 0;
 
-type Export = extern "system" fn(*mut Movie, usize, usize, usize) -> usize;
+type Export = extern "win64" fn(*mut Movie, usize, usize, usize) -> usize;
 
 const WRAPPERS: [Export; 9] = [
     close,
@@ -191,7 +191,7 @@ fn skipped(movie: *mut Movie) -> bool {
     skip
 }
 
-extern "system" fn close(movie: *mut Movie, a: usize, b: usize, c: usize) -> usize {
+extern "win64" fn close(movie: *mut Movie, a: usize, b: usize, c: usize) -> usize {
     if let Some(movies) = movies().as_mut() {
         movies.remove(&(movie as usize));
     }
@@ -202,7 +202,7 @@ extern "system" fn close(movie: *mut Movie, a: usize, b: usize, c: usize) -> usi
 /// `$skipped` for a skipped movie and calls the DLL for any other.
 macro_rules! wrapper {
     ($name:ident, $i:literal, $skipped:expr) => {
-        extern "system" fn $name(movie: *mut Movie, a: usize, b: usize, c: usize) -> usize {
+        extern "win64" fn $name(movie: *mut Movie, a: usize, b: usize, c: usize) -> usize {
             if skipped(movie) {
                 return $skipped;
             }
@@ -266,17 +266,17 @@ mod tests {
     static CALLS: AtomicUsize = AtomicUsize::new(0);
     static CLOSED: AtomicUsize = AtomicUsize::new(0);
 
-    extern "system" fn dll_wait(_: *mut Movie, _: usize, _: usize, _: usize) -> usize {
+    extern "win64" fn dll_wait(_: *mut Movie, a: usize, b: usize, c: usize) -> usize {
         CALLS.fetch_add(1, Ordering::Relaxed);
-        7
+        7 + a + 2 * b + 4 * c
     }
-    extern "system" fn dll_next(movie: *mut Movie, _: usize, _: usize, _: usize) -> usize {
+    extern "win64" fn dll_next(movie: *mut Movie, _: usize, _: usize, _: usize) -> usize {
         CALLS.fetch_add(1, Ordering::Relaxed);
         // SAFETY: the test's own movie.
         unsafe { (*movie).frame_num += 1 };
         0
     }
-    extern "system" fn dll_close(_: *mut Movie, _: usize, _: usize, _: usize) -> usize {
+    extern "win64" fn dll_close(_: *mut Movie, _: usize, _: usize, _: usize) -> usize {
         CLOSED.fetch_add(1, Ordering::Relaxed);
         0
     }
@@ -298,10 +298,11 @@ mod tests {
     // The wrappers' state is global, so all of it in one test.
     #[test]
     fn skips_movies_and_passes_the_rest_through() {
-        let bind = |mode, dll: &str, name: &str, f: Export| -> Export {
+        type GuestExport = extern "win64" fn(*mut Movie, usize, usize, usize) -> usize;
+        let bind = |mode, dll: &str, name: &str, f: Export| -> GuestExport {
             let address = wrap_with(mode, dll, name, f as usize);
             // SAFETY: either `f` or a wrapper of the same type.
-            unsafe { std::mem::transmute::<usize, Export>(address) }
+            unsafe { std::mem::transmute::<usize, GuestExport>(address) }
         };
         let dll = "Bink2Scarlett.dll";
         // Off, other DLLs and exports that are not wrapped stay as they are.
@@ -334,7 +335,7 @@ mod tests {
         // A looping one plays.
         let mut menu = movie(120, WILL_LOOP);
         let menu_ptr: *mut Movie = &mut *menu;
-        assert_eq!(wait(menu_ptr, 0, 0, 0), 7);
+        assert_eq!(wait(menu_ptr, 11, 13, 17), 112);
         next(menu_ptr, 0, 0, 0);
         assert_eq!(menu.frame_num, 2);
         assert_eq!(CALLS.load(Ordering::Relaxed), 2);
