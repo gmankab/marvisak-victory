@@ -340,6 +340,33 @@ fn uav_barrier() -> D3D12_RESOURCE_BARRIER {
 mod tests {
     use super::*;
 
+    fn read_arguments(
+        host: &crate::host::Host,
+        list: &HostList,
+        args: &ID3D12Resource,
+        bytes: u64,
+    ) -> (ID3D12Resource, *mut u8) {
+        let (readback, data) = host.shared_buffer(bytes).unwrap();
+        let indirect = D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT;
+        let source = D3D12_RESOURCE_STATE_COPY_SOURCE;
+        let common = D3D12_RESOURCE_STATE_COMMON;
+        let dest = D3D12_RESOURCE_STATE_COPY_DEST;
+        // SAFETY: an open list, live buffers of at least `bytes`, and a
+        // readable argument buffer left by this list's clamp.
+        unsafe {
+            list.list.ResourceBarrier(&[
+                transition(args, indirect, source),
+                transition(&readback, common, dest),
+            ]);
+            list.list.CopyBufferRegion(&readback, 0, args, 0, bytes);
+            list.list.ResourceBarrier(&[
+                transition(args, source, indirect),
+                transition(&readback, dest, common),
+            ]);
+        }
+        (readback, data)
+    }
+
     /// The clamp compiles with the system's compiler and the host takes it.
     #[test]
     fn argument_clamp_builds() {
@@ -383,13 +410,12 @@ mod tests {
         };
         let output = bound(&list, (&input, 4), None, (1, 24, 2)).expect("clamp recorded");
         assert_ne!(output, input);
+        let (_readback, mapped) = read_arguments(host, &list, &output, 11 * 4);
         list.close();
         host.execute(&[&list]);
 
-        let mut mapped = std::ptr::null_mut();
         // SAFETY: the GPU finished. Both mapped buffers cover the inspected words.
         unsafe {
-            output.Map(0, None, Some(&mut mapped)).unwrap();
             let clamped = std::slice::from_raw_parts(mapped.cast::<u32>(), 11);
             assert_eq!(&clamped[..5], &[1 << 24, 4, 31, u32::MAX - 16, 7]);
             assert_eq!(&clamped[6..], &[3, 2, 12, 0, 6]);
@@ -413,17 +439,15 @@ mod tests {
             }
             let output = bound(&list, (&input, 0), None, (0, 16, draws.len() as u32))
                 .expect("clamp recorded");
+            let (_readback, mapped) = read_arguments(host, &list, &output, bytes);
             list.close();
             host.execute(&[&list]);
             // SAFETY: the clamp completed and each mapping covers the inspected records.
             unsafe {
-                let mut mapped = std::ptr::null_mut();
-                output.Map(0, None, Some(&mut mapped)).unwrap();
                 let records = std::slice::from_raw_parts(mapped.cast::<[u32; 4]>(), draws.len());
                 let counts = records.iter().map(|r| r[0]).collect::<Vec<_>>();
                 assert!(records.iter().zip(draws).all(|(clamped, src)| clamped[2..] == src[2..]));
                 assert_eq!(std::slice::from_raw_parts(data.cast::<[u32; 4]>(), draws.len()), draws);
-                output.Unmap(0, None);
                 counts
             }
         };
@@ -515,20 +539,25 @@ void main(uint3 group : SV_GroupID) {
         for count in [0u32, 1, 7] {
             let title = [2u32, 1, 1, 3, 1, 1, count];
             let sentinel = [2u32, 1, 1, 1, 1, 1, 1];
+            let seed = [1u32, 1, 1, 1, 1, 1, 2];
             let (input, data) = host.shared_buffer(size_of_val(&title) as u64).unwrap();
+            let (seed_input, seed_data) = host.shared_buffer(size_of_val(&seed) as u64).unwrap();
             let (witness, witnessed) = host.shared_buffer(512).unwrap();
             let list = host.new_list().unwrap();
-            let output = bound(&list, (&input, 0), Some((&input, 24)), (2, 12, 2)).unwrap();
-            let mut mapped = std::ptr::null_mut();
             // SAFETY: the idle mappings cover all initialized words.
             unsafe {
                 std::ptr::copy_nonoverlapping(title.as_ptr(), data.cast::<u32>(), title.len());
+                std::ptr::copy_nonoverlapping(seed.as_ptr(), seed_data.cast::<u32>(), seed.len());
                 witnessed.cast::<u32>().write(0);
-                output.Map(0, None, Some(&mut mapped)).unwrap();
-                std::ptr::copy_nonoverlapping(sentinel.as_ptr(), mapped.cast::<u32>(), sentinel.len());
             }
+            // Populate both slots on the GPU, then check that the next
+            // clamp changes only the slots inside its active count.
+            let seeded = bound(&list, (&seed_input, 0), Some((&seed_input, 24)), (2, 12, 2)).unwrap();
+            let output = bound(&list, (&input, 0), Some((&input, 24)), (2, 12, 2)).unwrap();
+            assert_eq!(seeded, output);
 
             record_witness(&list, &pipeline, &output, (&witness, 0), 2);
+            let (_readback, mapped) = read_arguments(host, &list, &output, size_of_val(&sentinel) as u64);
             list.close();
             host.execute(&[&list]);
 
@@ -542,7 +571,6 @@ void main(uint3 group : SV_GroupID) {
                 assert_eq!(&words[1 + tail..], &sentinel[1 + tail..]);
                 assert_eq!(witnessed.cast::<u32>().read(), (active * 128) as u32);
                 assert_eq!(std::slice::from_raw_parts(data.cast::<u32>(), title.len()), title);
-                output.Unmap(0, None);
             }
         }
     }
