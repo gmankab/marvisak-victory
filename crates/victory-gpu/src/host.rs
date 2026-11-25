@@ -61,6 +61,8 @@ pub(crate) struct Host {
     /// layer's messages.
     messages: Option<ID3D12InfoQueue>,
     next_rtv: AtomicU32,
+    /// Immutable upload word used to initialize each indirect budget.
+    indirect_zero: OnceLock<Option<ID3D12Resource>>,
     presenter: Mutex<Option<Presenter>>,
 }
 
@@ -260,6 +262,7 @@ fn create() -> windows::core::Result<Host> {
             next_dsv: AtomicU32::new(0),
             messages,
             next_rtv: AtomicU32::new(0),
+            indirect_zero: OnceLock::new(),
             presenter: Mutex::new(None),
         })
     }
@@ -338,7 +341,7 @@ pub(crate) struct HostList {
     pipelines: Mutex<std::collections::BTreeSet<String>>,
     /// The work its indirect executions may still do (`indirect`): a
     /// shader-writable word, zeroed when the list is submitted.
-    budget: OnceLock<Option<(ID3D12Resource, usize)>>,
+    budget: OnceLock<Option<ID3D12Resource>>,
     arguments: Mutex<Option<ArgumentBuffer>>,
     /// The texts of the markers `note_op` set, in order (for device-removed
     /// data without marker texts), with the host GPU range a copy reads.
@@ -510,7 +513,7 @@ struct Deferred {
     /// Bottom-of-pipe writes, done once the list has run: address, what,
     /// bytes.
     writes: Vec<(usize, crate::queue::Written, usize)>,
-    /// Whether a step zeroes the indirect-work budget.
+    /// Whether the recording initialized the indirect budget and left it as a UAV.
     budget_zeroed: bool,
 }
 
@@ -1009,6 +1012,16 @@ impl HostList {
         if let Some(arguments) = self.arguments.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
             self.finish_arguments(arguments);
         }
+        if self.deferred().budget_zeroed && let Some(Some(budget)) = self.budget.get() {
+            // SAFETY: the open list initialized this budget before its clamps.
+            unsafe {
+                self.list.ResourceBarrier(&[transition(
+                    budget,
+                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                    D3D12_RESOURCE_STATE_COMMON,
+                )]);
+            }
+        }
         #[cfg(feature = "diagnostics")]
         if timing() {
             let count = self.notes.lock().unwrap_or_else(|e| e.into_inner()).len() as u32;
@@ -1268,24 +1281,40 @@ impl HostList {
         Some((gpu + at, (data + at as usize) as *mut u8))
     }
 
-    /// The host address of the list's indirect-work budget, zeroed at each
-    /// submission of the list from the first use after a reset on.
+    /// The address of the GPU's indirect-work budget. Record its zeroing
+    /// before the first clamp so each execution starts with a fresh budget.
     pub(crate) fn budget(&self) -> Option<u64> {
-        let (buffer, data) = self
+        const BYTES: u64 = size_of::<u32>() as u64;
+        let buffer = self
             .budget
             .get_or_init(|| {
-                let (b, d) = host()?.shared_buffer(256)?;
-                Some((b, d as usize))
+                let buffer = host()?.indirect_buffer(256)?;
+                name(&buffer, || "indirect budget".into());
+                Some(buffer)
             })
             .as_ref()?;
         let mut deferred = self.deferred();
         if !deferred.budget_zeroed {
+            let host = host()?;
+            let zero = host
+                .indirect_zero
+                .get_or_init(|| {
+                    let (buffer, data) = host.upload_buffer(BYTES)?;
+                    // SAFETY: the upload word is being initialized before use.
+                    unsafe { data.cast::<u32>().write(0) };
+                    Some(buffer)
+                })
+                .as_ref()?;
+            let copy = D3D12_RESOURCE_STATE_COPY_DEST;
+            let uav = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+            // SAFETY: the list is open, the budget starts in COMMON and
+            // the immutable upload buffer holds the four bytes copied.
+            unsafe {
+                self.list.ResourceBarrier(&[transition(buffer, D3D12_RESOURCE_STATE_COMMON, copy)]);
+                self.list.CopyBufferRegion(buffer, 0, zero, 0, BYTES);
+                self.list.ResourceBarrier(&[transition(buffer, copy, uav)]);
+            }
             deferred.budget_zeroed = true;
-            let at = *data;
-            // SAFETY: the list's own mapped word, written before it runs.
-            deferred
-                .copies
-                .push(Step::Host(Box::new(move || unsafe { (at as *mut u32).write_volatile(0) })));
         }
         // SAFETY: a live buffer.
         Some(unsafe { buffer.GetGPUVirtualAddress() })
@@ -2051,14 +2080,14 @@ pub(crate) fn legal_for(flags: u32, state: u32) -> u32 {
 }
 
 impl Host {
-    /// Only the GPU reads and writes the private indirect arguments.
+    /// Allocates private indirect storage, which only the GPU accesses.
     fn indirect_buffer(&self, size: u64) -> Option<ID3D12Resource> {
         let heap = D3D12_HEAP_PROPERTIES {
             Type: D3D12_HEAP_TYPE_DEFAULT,
             ..Default::default()
         };
         self.common_uav_buffer(size, &heap)
-            .inspect_err(|e| tracing::debug!(error = %e, size, "indirect arguments in shared memory"))
+            .inspect_err(|e| tracing::debug!(error = %e, size, "indirect storage in shared memory"))
             .ok()
             .or_else(|| self.shared_buffer(size).map(|(buffer, _)| buffer))
     }

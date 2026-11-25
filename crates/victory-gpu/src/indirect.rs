@@ -621,4 +621,37 @@ void main(uint3 group : SV_GroupID) {
         list.close();
         check([384, 0, 256]);
     }
+
+    #[test]
+    fn argument_clamp_budget_resets_on_replay() {
+        let Some(host) = host() else { return };
+        if cfg!(not(windows)) && std::env::var_os("VICTORY_DXCOMPILER").is_none() {
+            return;
+        }
+        const VERTICES: u32 = 1 << 24;
+        let draws = [[VERTICES, 4, 11, 17], [VERTICES, 4, 11, 17], [1, 1, 11, 17]];
+        let (input, data) = host.shared_buffer(size_of_val(&draws) as u64).unwrap();
+        // SAFETY: the idle mapping covers all three initialized draws.
+        unsafe { std::ptr::copy_nonoverlapping(draws.as_ptr(), data.cast(), draws.len()) };
+        let list = host.new_list().unwrap();
+        for _ in 0..2 {
+            // Clamp only: the two large draws are never executed.
+            let full = bound(&list, (&input, 0), None, (0, 16, 2)).unwrap();
+            let (_full_readback, full_data) = read_arguments(host, &list, &full, 32);
+            let spent = bound(&list, (&input, 32), None, (0, 16, 1)).unwrap();
+            let (_spent_readback, spent_data) = read_arguments(host, &list, &spent, 16);
+            list.close();
+            for _ in 0..2 {
+                host.execute(&[&list]);
+                // SAFETY: execution completed and the two snapshots are live.
+                let counts = unsafe {
+                    let full = full_data.cast::<u32>();
+                    [full.read(), full.add(4).read(), spent_data.cast::<u32>().read()]
+                };
+                assert_eq!(counts, [VERTICES, VERTICES, 0]);
+            }
+            list.reset();
+        }
+        list.close();
+    }
 }
