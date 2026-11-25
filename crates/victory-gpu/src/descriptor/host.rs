@@ -114,6 +114,11 @@ pub(crate) struct HostHeap {
     /// (`victory_shader::emit::SLOT_STRIDES`): an upload buffer of
     /// `SLOT_STRIDES_COUNT` dwords, its GPU address and its mapping.
     strides: Option<(ID3D12Resource, u64, usize)>,
+    /// View heaps: the 64-bit title GPU address of the buffer view at each
+    /// title slot (`victory_shader::emit::SLOT_VIEW_ADDRESSES`): an upload
+    /// buffer of `SLOT_STRIDES_COUNT` pairs of dwords (lo, hi), its GPU
+    /// address and its mapping.
+    addresses: Option<(ID3D12Resource, u64, usize)>,
     /// Title slots holding buffer views. Such a view gets its host slot
     /// (and its memory a host copy) only when something reads it: a draw
     /// through a table, or [`HostHeap::buffer_slots`] for shaders that pick
@@ -1237,6 +1242,19 @@ impl HostHeap {
                 Some((buffer, gpu, data as usize))
             })
             .flatten();
+        let addresses = (!sampler)
+            .then(|| {
+                let bytes = u64::from(victory_shader::emit::SLOT_STRIDES_COUNT) * 8;
+                let (buffer, data) = host.upload_buffer(bytes)?;
+                // SAFETY: the buffer's whole mapping; a live buffer.
+                let gpu = unsafe {
+                    std::ptr::write_bytes(data, 0, bytes as usize);
+                    buffer.GetGPUVirtualAddress()
+                };
+                crate::host::name(&buffer, || "buffer addresses by view heap slot".to_owned());
+                Some((buffer, gpu, data as usize))
+            })
+            .flatten();
         let h = HostHeap {
             heap,
             cpu,
@@ -1255,6 +1273,7 @@ impl HostHeap {
             free: std::sync::atomic::AtomicU32::new(DYNAMIC),
             too_long: std::sync::atomic::AtomicU32::new(u32::MAX),
             strides,
+            addresses,
             buffers: Mutex::default(),
             changed: Mutex::default(),
             textures: Mutex::default(),
@@ -1440,6 +1459,17 @@ impl HostHeap {
     /// The table's buffer, for a list to hold.
     pub(crate) fn strides_buffer(&self) -> Option<&ID3D12Resource> {
         self.strides.as_ref().map(|s| &s.0)
+    }
+
+    /// The GPU address of the table of buffer addresses by title slot (view
+    /// heaps).
+    pub(crate) fn addresses_gpu(&self) -> Option<u64> {
+        self.addresses.as_ref().map(|a| a.1)
+    }
+
+    /// The buffer-address table's buffer, for a list to hold.
+    pub(crate) fn addresses_buffer(&self) -> Option<&ID3D12Resource> {
+        self.addresses.as_ref().map(|a| &a.0)
     }
 
     /// Up to `max` title slots whose texture view is due at `frame`, each
@@ -2159,6 +2189,17 @@ impl HostHeap {
             // dword, either value is one the slot had).
             unsafe { (*data as *mut u32).add(index as usize).write_volatile(stride.unwrap_or(0)) };
         }
+        let address = view.and_then(view_address).unwrap_or(0);
+        if let Some((_, _, data)) = &self.addresses
+            && index < victory_shader::emit::SLOT_STRIDES_COUNT
+        {
+            // SAFETY: inside the mapping (2 dwords per slot).
+            unsafe {
+                let p = (*data as *mut u32).add(index as usize * 2);
+                p.write_volatile(address as u32);
+                p.add(1).write_volatile((address >> 32) as u32);
+            }
+        }
         let mut buffers = self.buffers.lock().unwrap_or_else(|e| e.into_inner());
         let was = if stride.is_some() {
             buffers.insert(index);
@@ -2730,6 +2771,21 @@ fn element_size(desc: &D3D12_SHADER_RESOURCE_VIEW_DESC) -> u64 {
         4
     } else {
         crate::resource::element(desc.Format.0 as u32).map_or(0, |(bytes, _)| bytes)
+    }
+}
+
+/// The 64-bit title GPU virtual address a buffer or constant-buffer view
+/// points at (`victory_shader::emit::SLOT_VIEW_ADDRESSES`).
+fn view_address(view: &View) -> Option<u64> {
+    if let Some((addr, _)) = buffer_range(view) {
+        return Some(addr);
+    }
+    match view {
+        View::Shader(r, None) | View::Unordered(r, _, None) => {
+            crate::resource::buffer_bytes(*r as crate::object::This).map(|(p, _)| p as u64)
+        }
+        View::Constant(addr, _) => Some(*addr),
+        _ => None,
     }
 }
 

@@ -24,6 +24,13 @@ pub const ROOT_CBV_SPACE: u32 = 1;
 /// root SRV also tells the host that the buffer views of the whole heap
 /// must be ready when it runs, not only those its tables name.
 pub const SLOT_STRIDES: u8 = 255;
+/// The root SRV `t<SLOT_VIEW_ADDRESSES>` in [`ROOT_CBV_SPACE`] of a shader
+/// that reads a buffer view's title address from the view heap (or a
+/// dynamically indexed descriptor table): a raw buffer of
+/// [`SLOT_STRIDES_COUNT`] pairs of dwords (lo, hi) the host keeps, entry
+/// `i` the 64-bit title GPU virtual address of the buffer view at heap slot
+/// `i` (0: none or not a buffer).
+pub const SLOT_VIEW_ADDRESSES: u8 = 252;
 /// Dwords of the [`SLOT_STRIDES`] buffer: heap indices are clamped to it.
 pub const SLOT_STRIDES_COUNT: u32 = 1 << 21;
 

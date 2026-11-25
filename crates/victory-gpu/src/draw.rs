@@ -1634,6 +1634,24 @@ impl State {
                         }
                         continue;
                     }
+                    if srv && slot == victory_shader::emit::SLOT_VIEW_ADDRESSES {
+                        // Ours: the title GPU addresses of buffer views in the
+                        // bound view heap, for shaders that read descriptors as
+                        // pointers from the heap.
+                        match self.heap_addresses(list) {
+                            // SAFETY: an open list; the table lives as long
+                            // as the heap the list holds.
+                            Some(gpu) => unsafe {
+                                if compute {
+                                    l.SetComputeRootShaderResourceView(param, gpu);
+                                } else {
+                                    l.SetGraphicsRootShaderResourceView(param, gpu);
+                                }
+                            },
+                            None => once!("a shader reads view addresses from a view heap that is not set"),
+                        }
+                        continue;
+                    }
                     let tabled = srv && crate::pipeline::host::bounded_root_srvs();
                     let Some(&Root::View(address)) = self.roots_ref(compute).get(usize::from(slot))
                     else {
@@ -1914,6 +1932,27 @@ impl State {
             }
         }
         true
+    }
+
+    /// The GPU address of the bound view heap's buffer-address table
+    /// (`victory_shader::emit::SLOT_VIEW_ADDRESSES`), keeping its buffer alive
+    /// for `list`.
+    fn heap_addresses(&self, list: &HostList) -> Option<u64> {
+        let heap = self
+            .heaps
+            .iter()
+            .filter(|&&h| h != 0)
+            .map(|&h| crate::descriptor::heap(h as This))
+            .find(|h| !h.samplers())?;
+        let host = heap.host()?;
+        let gpu = host.addresses_gpu()?;
+        const ONCE: usize = usize::MAX - 0x5f;
+        if list.first_use(ONCE)
+            && let Some(buffer) = host.addresses_buffer()
+        {
+            list.keep(buffer);
+        }
+        Some(gpu)
     }
 
     /// For a shader that picks buffers from the view heap by an index it

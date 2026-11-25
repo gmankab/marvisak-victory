@@ -2882,30 +2882,63 @@ impl<'a> Lower<'a> {
     /// descriptor holds more in the second dword, the stride from bit 16
     /// up; code that takes the address masks those away.)
     fn view_address(&mut self, site: Site) -> Option<(V, V)> {
-        use super::shader::USER_VIEW_ADDRESS;
+        use super::shader::{SLOT_STRIDES_COUNT, SLOT_VIEW_ADDRESSES, USER_VIEW_ADDRESS};
         let a = self.scalar.get(&site).copied()?;
         let rp = *self.x.native.layout.get(a.param)?;
-        if rp.root != RootType::Table || a.dynamic.is_some() || a.offset % 32 != 0 {
+        if a.offset % 32 != 0 {
             return None;
         }
-        let dword = a.offset / 4;
-        let used = self
-            .x
-            .native
-            .used
-            .iter()
-            .filter(|u| {
-                u.root == RootType::Table
-                    && u.user_data == rp.user_data
-                    && u.table_offset_dwords <= dword
-            })
-            .max_by_key(|u| u.table_offset_dwords)?;
-        if used.dwords != 4 || !matches!(used.kind, ResourceType::Srv | ResourceType::Uav) {
-            return None;
+        if rp.root == RootType::Table && a.dynamic.is_none() {
+            let dword = a.offset / 4;
+            let used = self
+                .x
+                .native
+                .used
+                .iter()
+                .filter(|u| {
+                    u.root == RootType::Table
+                        && u.user_data == rp.user_data
+                        && u.table_offset_dwords <= dword
+                })
+                .max_by_key(|u| u.table_offset_dwords)?;
+            if used.dwords != 4 || !matches!(used.kind, ResourceType::Srv | ResourceType::Uav) {
+                return None;
+            }
+            let lo = self.host_word(RootType::Other(USER_VIEW_ADDRESS), rp.slot, dword);
+            let hi = self.host_word(RootType::Other(USER_VIEW_ADDRESS + 1), rp.slot, dword);
+            return Some((lo, hi));
         }
-        let lo = self.host_word(RootType::Other(USER_VIEW_ADDRESS), rp.slot, dword);
-        let hi = self.host_word(RootType::Other(USER_VIEW_ADDRESS + 1), rp.slot, dword);
-        Some((lo, hi))
+        // A buffer view loaded from the view heap (or a dynamically indexed
+        // table in it): read its 64-bit title address from the host's per-slot
+        // table (`SLOT_VIEW_ADDRESSES`).
+        if matches!(rp.root, RootType::ResourceHeap | RootType::Table) {
+            let slot = self.heap_index(site, 0, false).ok()?;
+            let c = self.cur;
+            let i32t = self.s.t.i32;
+            let last = self.s.m.i32(SLOT_STRIDES_COUNT - 1);
+            let slot = self.s.op(c, "binary.i32", Attr::ReadNone, i32t, 40, &[slot, last]);
+            self.s.m.tag(slot, Tag::Clamp);
+            let three = self.s.m.i32(3);
+            let byte = self.s.m.bin(c, Bin::Shl, slot, three);
+            let h = self.s.root_srv_handle(SLOT_VIEW_ADDRESSES);
+            let iu = self.s.m.undef(i32t);
+            let mask = self.s.m.i8(3);
+            let align = self.s.m.i32(8);
+            let r = self.s.op(
+                c,
+                "rawBufferLoad.f32",
+                Attr::ReadOnly,
+                self.s.t.res_ret,
+                139,
+                &[h, byte, iu, mask, align],
+            );
+            let lo = self.s.m.extract(c, r, 0);
+            let lo = self.as_int(lo);
+            let hi = self.s.m.extract(c, r, 1);
+            let hi = self.as_int(hi);
+            return Some((lo, hi));
+        }
+        None
     }
 
     /// `lo`, `hi` plus the instruction's byte offset `off`, with the carry.
@@ -3254,15 +3287,23 @@ impl<'a> Lower<'a> {
         };
         let &m = self.x.st.masks.get(&lo).ok_or(LANE_MASK)?;
         // A mask that holds lanes outside EXEC where it is written (the complement of one,
-        // say) is the ballot of the lanes that are there: all of them, where two exchanging
-        // host waves know every lane runs that block.
-        let made = self.def_block.get(&lo).copied();
-        let whole = self.exchange.is_some() && !self.local && made.is_none_or(|b| self.all_lanes(b));
-        if !self.x.st.active.contains(&lo) && !whole {
-            if self.exchange.is_some() && !self.local {
-                need(made.unwrap_or(0));
+        // say) is the ballot of the lanes that are there: all of them, where every lane of
+        // the wave runs that block.
+        if !self.x.st.active.contains(&lo) {
+            let made = self.def_block.get(&lo).copied();
+            let whole = self.mask_data == MaskData::Console
+                && !self.local
+                && made.is_none_or(|b| match &self.exchange {
+                    Some((_, _, all)) => all.get(b).copied().unwrap_or(false),
+                    None => all_lane_blocks(self.x.st)
+                        .is_some_and(|all| all.get(b).copied().unwrap_or(false)),
+                });
+            if !whole {
+                if self.mask_data == MaskData::Console && !self.local {
+                    need(made.unwrap_or(0));
+                }
+                return Err(MASK_ELSEWHERE);
             }
-            return Err(MASK_ELSEWHERE);
         }
         let (x, y) = match self.ballots.get(&lo) {
             Some(&xy) => xy,
@@ -12324,5 +12365,46 @@ mod tests {
         )
         .expect("Source::Phi of immediate constant samplers");
         assert_eq!(out.samplers.len(), 2);
+    }
+
+    #[test]
+    fn heap_descriptor_address_reads_from_view_address_table() {
+        // Loads a buffer descriptor from the bindless resource heap at a
+        // dynamic byte offset (`s1 << 5`), reads title memory through its
+        // 64-bit address, and stores the dword to LDS.
+        let words = [
+            0xBE84_0300, // s_mov_b32 s4, s0
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0x8F06_8501, // s_lshl_b32 s6, s1, 5
+            0xF408_0202,
+            0x0C00_0000, // s_load_dwordx4 s[8:11], s[4:5], s6
+            0xF400_0304,
+            0xFA00_0000, // s_load_dword s12, s[8:9], null
+            0x7E02_020C, // v_mov_b32 v1, s12
+            0xD834_0000,
+            0x0000_0100, // ds_write_b32 v0, v1
+            S_ENDPGM,
+        ];
+        let layout = vec![
+            root(RootType::ResourceHeap, 0, 0),
+            root(RootType::Constants, 1, 1),
+        ];
+        let l = lower_wave(&words, layout, Vec::new(), false).unwrap();
+        assert!(l.root_srvs.contains(&super::super::SLOT_VIEW_ADDRESSES));
+        assert!(l.root_srvs.contains(&super::super::SLOT_MEMORY));
+    }
+
+    #[test]
+    fn native_wave32_complement_mask_in_all_lanes_block_lowers() {
+        // A complement of EXEC holds lanes outside EXEC, but in an all-lanes
+        // block of a native wave32 compute shader every lane runs the ballot.
+        let words = [
+            0x8802_C17E, // s_xor_b32 s2, exec_lo, -1
+            0x7E02_0202, // v_mov_b32 v1, s2
+            0xD834_0000,
+            0x0000_0100, // ds_write_b32 v0, v1
+            S_ENDPGM,
+        ];
+        lower_wave(&words, Vec::new(), Vec::new(), false).unwrap();
     }
 }

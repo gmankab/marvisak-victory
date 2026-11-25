@@ -116,8 +116,8 @@ pub use lower::set_host_max_wave;
 pub use rect::rect_list_gs;
 pub use shader::{
     MEMORY_FAULTS, MEMORY_PAGES, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDES,
-    SLOT_STRIDES_COUNT, USER_DATA_SPACE, USER_GROUP_BASE, USER_MEMORY_BASE, USER_VIEW_ADDRESS, USER_VIEW_BIAS,
-    portable_heap, set_view_heap_limit, view_heap_limit,
+    SLOT_STRIDES_COUNT, SLOT_VIEW_ADDRESSES, USER_DATA_SPACE, USER_GROUP_BASE, USER_MEMORY_BASE,
+    USER_VIEW_ADDRESS, USER_VIEW_BIAS, portable_heap, set_view_heap_limit, view_heap_limit,
 };
 
 /// The stack for threads that make host pipelines from translated shaders.
@@ -539,12 +539,13 @@ pub fn emit(
         }
     }
     // SCC of a mask operation joined with a scalar test behind a per-lane skip (the 32-lane
-    // trace programs): right once the wave takes that skip together ([`widen`]; the
-    // lowering has named the skipped blocks).
+    // trace programs), or a mask holding lanes outside EXEC written behind a per-lane skip:
+    // right once the wave takes that skip together ([`widen`]; the lowering has named the
+    // skipped blocks).
     let original = match original {
         Err(ShaderError::Unsupported { what, .. })
             if native.stage == HwStage::Cs
-                && what == lower::LANE_MASK
+                && (what == lower::LANE_MASK || what == lower::MASK_ELSEWHERE)
                 && std::env::var_os("VICTORY_WAVE_WIDE").is_none_or(|v| v != "0") =>
         {
             let again = widen(c, native, p, std::env::var_os("VICTORY_WAVE_WHY").is_some());
