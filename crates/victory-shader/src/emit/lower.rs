@@ -6889,70 +6889,64 @@ mod tests {
         );
     }
 
-    #[test]
-    fn image_atomics_64_bit_declare_typed_and_heap_features() {
+    fn image_atomic_fixture(atomics: &[[u32; 2]]) -> super::Lowered {
         use crate::native::{RootParam, RootType};
 
-        let run = |mimg_w0: u32| {
-            let words = [
-                // s_mov_b32 s1, 0
-                0xBE81_0380u32,
-                // s_load_dwordx8 s[4:11], s[0:1], null
-                0xF40C_0100,
-                0xFA00_0000,
-                // v_mov_b32 v0..v5, 0/1/2
-                0x7E00_0280,
-                0x7E02_0280,
-                0x7E04_0281,
-                0x7E06_0280,
-                0x7E08_0282,
-                0x7E0A_0280,
-                // image_atomic_* (2D, unorm=1, glc=1) v[2..], v0, s[4:11]
-                mimg_w0,
-                0x0001_0200,
-                S_ENDPGM,
-            ];
-            let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
-            let native = NativeProgram {
-                stage: HwStage::Cs,
-                wave64: false,
-                vgprs: 8,
-                layout: vec![RootParam {
-                    root: RootType::Table,
-                    table_offset_dwords: 0,
-                    sgprs: 1,
-                    base_register: 0,
-                    user_data: 0,
-                    slot: 0,
-                }],
-                used: vec![],
-                io: StageIo::Cs(ComputeIo {
-                    rsrc2: 0,
-                    threads: [1, 1, 1],
-                }),
-                code,
-            };
-            let p = ir::build(&native.code, false, 8).unwrap();
-            let res = resource::track(&p, &native.layout, native.stage).unwrap();
-            let io = io::raise(&p, &native).unwrap();
-            let st = structure::structure(&p).unwrap();
-            lower(&Parts {
-                native: &native,
-                p: &p,
-                st: &st,
-                io: &io,
-                res: &res,
-                inputs: vec![],
-                outputs: vec![],
-                prims: vec![],
-                mesh_stride: 0,
-            })
+        let mut words = vec![
+            0xBE81_0380u32, // s_mov_b32 s1, 0
+            0xF40C_0100,
+            0xFA00_0000, // s_load_dwordx8 s[4:11], s[0:1], null
+            0x7E00_0280, // v0/v1: coordinates
+            0x7E02_0280,
+            0x7E04_0281, // v2/v3: 0x00000002_00000001
+            0x7E06_0282,
+            0x7E08_02C1, // v4/v5: 0x00000004_ffffffff
+            0x7E0A_0284,
+        ];
+        words.extend(atomics.iter().flatten().copied());
+        words.push(S_ENDPGM);
+        let native = NativeProgram {
+            stage: HwStage::Cs,
+            wave64: false,
+            vgprs: 8,
+            layout: vec![RootParam {
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                sgprs: 1,
+                base_register: 0,
+                user_data: 0,
+                slot: 0,
+            }],
+            used: vec![],
+            io: StageIo::Cs(ComputeIo {
+                rsrc2: 0,
+                threads: [1, 1, 1],
+            }),
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
         };
+        let p = ir::build(&native.code, false, 8).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage).unwrap();
+        let io = io::raise(&p, &native).unwrap();
+        let st = structure::structure(&p).unwrap();
+        lower(&Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: vec![],
+            outputs: vec![],
+            prims: vec![],
+            mesh_stride: 0,
+        })
+        .unwrap()
+    }
 
-        // image_atomic_add (op 0x11), dim=1 (2D), unorm=1, dmask=3, glc=1
-        let add = run(0xF044_1388).unwrap();
-        // image_atomic_cmpswap (op 0x10), dim=1 (2D), unorm=1, dmask=0xf, glc=1
-        let cmp = run(0xF040_1F88).unwrap();
+    #[test]
+    fn image_atomics_64_bit_declare_typed_and_heap_features() {
+        // 2D image_atomic_add (64-bit), then compare-exchange in a separate shader.
+        let add = image_atomic_fixture(&[[0xF044_1388, 0x0001_0200]]);
+        let cmp = image_atomic_fixture(&[[0xF040_1F88, 0x0001_0200]]);
         let mut validator = crate::emit::validator::Validator::load(
             crate::emit::validator::Validator::default_path().as_deref(),
         )
@@ -6975,5 +6969,47 @@ mod tests {
                 validator.validate(&mut lowered.dxil).unwrap();
             }
         }
+    }
+
+    #[test]
+    fn image_atomic_64_readback_carries_into_the_high_dword() {
+        use crate::emit::HostShader;
+        use crate::emit::host::{Dispatch, Host, Root, View};
+
+        let Ok(host) = Host::new(false) else {
+            eprintln!("no SM 6.6 host; skipped");
+            return;
+        };
+        if !host.supports_uint2_image_atomics() {
+            eprintln!("no 64-bit heap atomics on R32G32_UINT; skipped");
+            return;
+        }
+
+        // Exchange writes 0x00000002_00000001 before the addition of
+        // 0x00000004_ffffffff. The carry must reach the upper dword.
+        let lowered = image_atomic_fixture(&[[0xF03C_1308, 0x0001_0200], [0xF044_1308, 0x0001_0400]]);
+        let shader = HostShader {
+            stage: HwStage::Cs,
+            dxil: lowered.dxil,
+            user_data: lowered.user_data,
+            samplers: lowered.samplers,
+            static_samplers: vec![],
+            root_cbvs: lowered.root_cbvs,
+            root_srvs: lowered.root_srvs,
+        };
+        let (root, pso) = host.compute_pipeline(&shader).unwrap();
+        let args = vec![0; shader.user_data_dwords() as usize];
+        let out = host.dispatch(
+            &root,
+            &pso,
+            &Dispatch {
+                roots: vec![(0, Root::Constants(args))],
+                views: &[View::Uint2TextureUav(1, 1)],
+                samplers: &[],
+                groups: [1, 1, 1],
+            },
+        ).unwrap();
+        assert_eq!(out, [vec![0, 7]]);
+        eprintln!("R32G32_UINT readback: [0, 7]");
     }
 }
