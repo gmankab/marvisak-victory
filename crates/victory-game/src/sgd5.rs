@@ -84,6 +84,11 @@ pub struct Database<'a> {
 pub struct Effect<'a> {
     pub name: &'a str,
     pub techniques: Vec<Technique<'a>>,
+    /// Every state description the effect holds (its passes pick from
+    /// these), as compact descriptions.
+    pub rasterizers: Vec<&'a [u8]>,
+    pub depth_stencils: Vec<&'a [u8]>,
+    pub blends: Vec<&'a [u8]>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -364,7 +369,13 @@ fn effect<'a>(c: &mut Cursor<'a>, shaders: &[Vec<Shader<'a>>; 6]) -> Option<Effe
             })
         })
         .collect::<Option<_>>()?;
-    Some(Effect { name, techniques })
+    Some(Effect {
+        name,
+        techniques,
+        rasterizers,
+        depth_stencils,
+        blends,
+    })
 }
 
 #[cfg(test)]
