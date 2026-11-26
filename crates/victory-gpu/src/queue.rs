@@ -60,8 +60,14 @@ enum Held {
     Running,
     /// With [`present_behind`]: the title's present of a frame, due after
     /// what the queue holds before it: the host texture shown, the state
-    /// the title's lists leave it in, and the frame's number.
-    Present(windows::Win32::Graphics::Direct3D12::ID3D12Resource, u32, u64),
+    /// the title's lists leave it in, the frame's number and the optional
+    /// interface plane with its state.
+    Present(
+        windows::Win32::Graphics::Direct3D12::ID3D12Resource,
+        u32,
+        u64,
+        Option<(windows::Win32::Graphics::Direct3D12::ID3D12Resource, u32)>,
+    ),
 }
 
 /// Presents that are in a queue's line and have not run ([`Held::Present`]).
@@ -162,10 +168,19 @@ fn send_behind(this: This, planes: u32, plane_parameters: *const Plane) -> bool 
     const COPY_SOURCE: u32 = 0x800;
     let state = crate::resource::host_transition(resource, COPY_SOURCE).map_or(COPY_SOURCE, |(_, before)| before);
     crate::resource::host_transition(resource, state);
+    // SAFETY: the title passes `planes` plane descriptions.
+    let over = unsafe { second_plane(planes, plane_parameters, resource) }.and_then(|resource| {
+        let texture = crate::resource::host_resource(resource)?.clone();
+        const READABLE: u32 = 0x80;
+        let state = crate::resource::host_transition(resource, READABLE)
+            .map_or(READABLE, |(_, before)| before);
+        crate::resource::host_transition(resource, state);
+        Some((texture, state))
+    });
     let texture = texture.clone();
     let sent = hold(this, || {
         PRESENTS_HELD.fetch_add(1, Ordering::Relaxed);
-        Held::Present(texture, state, frame)
+        Held::Present(texture, state, frame, over)
     });
     if sent {
         PRESENTS_BEHIND.fetch_add(1, Ordering::Relaxed);
@@ -891,10 +906,15 @@ fn release_held_now(all: bool) {
                             }
                         }
                     }
-                    Held::Present(texture, state, frame) => {
+                    Held::Present(texture, state, frame, over) => {
                         let show = || {
                             if let Some(host) = crate::host::host() {
-                                let _ = host.present(&texture, state, frame, None);
+                                let _ = host.present(
+                                    &texture,
+                                    state,
+                                    frame,
+                                    over.as_ref().map(|(texture, state)| (texture, *state)),
+                                );
                             }
                         };
                         if all {
