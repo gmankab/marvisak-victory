@@ -14,6 +14,9 @@ use victory_pe::layout::{self, dir};
 use victory_pe::{ImageInfo, ImportSymbol};
 
 use super::{seh, teb, thread, tls, vm};
+
+#[cfg(feature = "diagnostics")]
+mod watchdog;
 use crate::thunks::{ImportSite, ThunkBlock, UnimplementedPolicy};
 use crate::{DLL_PROCESS_ATTACH, DLL_PROCESS_DETACH, ImportResolver, Provenance, Resolution};
 
@@ -153,6 +156,10 @@ pub fn load(original: &[u8], path: &Path) -> Result<LoadedImage> {
         }
         if base != preferred {
             relocate(image, original, base.wrapping_sub(preferred) as u64)?;
+        }
+        #[cfg(feature = "diagnostics")]
+        if !info.is_dll() {
+            watchdog::apply(image, original);
         }
         Ok(())
     })();
