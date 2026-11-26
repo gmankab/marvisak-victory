@@ -912,11 +912,24 @@ impl<'a> Lower<'a> {
     /// Values of the program's input registers.
     fn inputs(&mut self) -> Result<(), Stop> {
         let io_inputs: HashMap<Value, Input> = self.x.io.inputs.iter().copied().collect();
+        let initialized_sgprs = match &self.x.native.io {
+            StageIo::Cs(compute) => Some(compute.initialized_sgprs()),
+            _ => None,
+        };
         for &(reg, v) in &self.x.p.inputs {
             let val = match reg {
                 Reg::S(_) if self.params.contains_key(&v) => continue, // loaded on first use
-                Reg::S(_) => match io_inputs.get(&v) {
+                Reg::S(number) => match io_inputs.get(&v) {
                     Some(&input) => self.input(input),
+                    // A path can appear to read an unset general register before its write.
+                    // Reserved registers and unmodeled hardware inputs still require a value.
+                    None if number <= 105
+                        && initialized_sgprs.is_some_and(|end| number >= end)
+                        && self.x.p.blocks.iter().flat_map(|block| &block.insts)
+                            .any(|instruction| instruction.write(reg).is_some()) =>
+                    {
+                        Val::I32(self.s.m.i32(0))
+                    }
                     None => Val::Missing("a hardware SGPR input"),
                 },
                 Reg::Scc => Val::Missing("SCC on entry"),
