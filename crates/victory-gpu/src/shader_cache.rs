@@ -98,6 +98,11 @@ fn build() -> &'static [u8; 32] {
     })
 }
 
+/// The build and lowering settings used by an offline pipeline cache.
+pub(crate) fn prebuild_fingerprint() -> ([u8; 32], u8) {
+    (*build(), mode_byte(effective_wave64_mode()))
+}
+
 /// The translation of a console shader container, from the cache when
 /// there is one.
 pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {

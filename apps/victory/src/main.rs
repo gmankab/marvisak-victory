@@ -5,6 +5,7 @@
 
 mod census;
 mod inspect;
+mod prebuild;
 mod run;
 mod shader;
 mod translate;
@@ -85,6 +86,9 @@ enum Command {
         /// Also create a host D3D12 pipeline for each emitted shader.
         #[arg(long)]
         pipelines: bool,
+        /// Build the shader pack's host pipelines into the runtime cache.
+        #[arg(long, conflicts_with_all = ["validate", "pipelines", "list"])]
+        prebuild_pipelines: bool,
         /// Print one line per program and outcome.
         #[arg(long)]
         list: bool,
@@ -158,9 +162,16 @@ fn main() -> Result<()> {
             paths,
             validate,
             pipelines,
+            prebuild_pipelines,
             list,
             jobs,
-        } => translate::run(paths, validate, pipelines, list, jobs),
+        } => {
+            if prebuild_pipelines {
+                prebuild::run(paths, jobs)
+            } else {
+                translate::run(paths, validate, pipelines, list, jobs)
+            }
+        }
         Command::Run {
             exe,
             unimplemented,
