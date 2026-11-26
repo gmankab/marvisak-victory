@@ -30,9 +30,15 @@ pub(crate) struct HostHeap {
     /// released the resource may still be read, and a freed host resource
     /// read there is a GPU page fault (the console reads stale memory).
     kept: Mutex<Vec<Option<ID3D12Resource>>>,
-    /// Where the search for free dynamic slots starts, and which are taken
-    /// (by lists not yet reset).
-    next: Mutex<(u32, Vec<bool>)>,
+    slots: Mutex<DynamicSlots>,
+}
+
+struct DynamicSlots {
+    next: usize,
+    /// Slots held by command lists until reset or release.
+    taken: Vec<bool>,
+    /// Requests at least this large cannot fit.
+    first_impossible: Option<usize>,
 }
 
 /// Host heaps' GPU ranges (start, bytes, bytes per slot, sampler), for
@@ -145,7 +151,11 @@ impl HostHeap {
             sampler,
             made: Mutex::new(vec![0; count as usize]),
             kept: Mutex::new(vec![None; (count + extra) as usize]),
-            next: Mutex::new((0, vec![false; extra as usize])),
+            slots: Mutex::new(DynamicSlots {
+                next: 0,
+                taken: vec![false; extra as usize],
+                first_impossible: None,
+            }),
         };
         // A slot never written is undefined: shaders reading one (a slot
         // the title wrote in a way we do not know, or a table entry no
@@ -227,12 +237,16 @@ impl HostHeap {
         if self.sampler || n == 0 || n > self.dynamic {
             return None;
         }
-        let mut guard = self.next.lock().unwrap_or_else(|e| e.into_inner());
-        let (next, taken) = &mut *guard;
+        let mut slots = self.slots.lock().unwrap_or_else(|e| e.into_inner());
         let n = n as usize;
+        // Allocations cannot lengthen any free run. A smaller request may
+        // still fit. A release can raise the bound.
+        if slots.first_impossible.is_some_and(|bound| n >= bound) {
+            return None;
+        }
         // Search from `next` on, then from the start (extending past cursor by
         // n - 1 so contiguous runs crossing the cursor are not missed).
-        let cursor = *next as usize;
+        let cursor = slots.next;
         let end = self.dynamic as usize;
         let second_end = cursor.saturating_add(n.saturating_sub(1)).min(end);
         let starts = (cursor..end).chain(0..second_end);
@@ -245,19 +259,20 @@ impl HostHeap {
                 run = 0;
             }
             last = at;
-            run = if taken[at] { 0 } else { run + 1 };
+            run = if slots.taken[at] { 0 } else { run + 1 };
             if run == n {
                 found = Some(at + 1 - n);
                 break;
             }
         }
         let Some(first) = found else {
+            slots.first_impossible = Some(n);
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| tracing::warn!(n, "no free dynamic descriptor slots: a table is not made"));
             return None;
         };
-        taken[first..first + n].fill(true);
-        *next = ((first + n) % self.dynamic as usize) as u32;
+        slots.taken[first..first + n].fill(true);
+        slots.next = (first + n) % end;
         Some(self.count + first as u32)
     }
 
@@ -275,10 +290,22 @@ impl HostHeap {
         let Some(at) = first.checked_sub(self.count) else {
             return;
         };
-        let mut guard = self.next.lock().unwrap_or_else(|e| e.into_inner());
-        let end = (at + n).min(self.dynamic) as usize;
-        if let Some(slots) = guard.1.get_mut(at as usize..end) {
-            slots.fill(false);
+        let mut slots = self.slots.lock().unwrap_or_else(|e| e.into_inner());
+        let end = at.saturating_add(n).min(self.dynamic) as usize;
+        let at = at as usize;
+        if at >= end {
+            return;
+        }
+        slots.taken[at..end].fill(false);
+        if let Some(bound) = slots.first_impossible {
+            // Only the free run touching the release can have grown.
+            let left = slots.taken[..at]
+                .iter()
+                .rev()
+                .take_while(|&&taken| !taken)
+                .count();
+            let right = slots.taken[end..].iter().take_while(|&&taken| !taken).count();
+            slots.first_impossible = Some(bound.max(left + (end - at) + right + 1));
         }
     }
 
@@ -1020,5 +1047,26 @@ mod tests {
         let last = first + heap.dynamic - 1;
         heap.release(last, 1);
         assert_eq!(heap.dynamic(2), None);
+    }
+
+    #[test]
+    fn failed_dynamic_requests_still_allow_smaller_requests_and_releases() {
+        let Some(heap) = HostHeap::new(false, 4) else {
+            eprintln!("no host descriptor heap; skipped");
+            return;
+        };
+        let first = heap.dynamic(heap.dynamic - 8).unwrap();
+        assert_eq!(heap.dynamic(10), None);
+        assert_eq!(heap.dynamic(12), None);
+        assert_eq!(heap.dynamic(8), Some(first + heap.dynamic - 8));
+        assert_eq!(heap.dynamic(1), None);
+        assert_eq!(heap.dynamic(8), None);
+        heap.release(first, 1);
+        heap.release(first + 2, 1);
+        assert_eq!(heap.dynamic(2), None);
+        assert_eq!(heap.slots.lock().unwrap().first_impossible, Some(2));
+        // Releasing the gap creates a three-slot run in this same frame.
+        heap.release(first + 1, 1);
+        assert_eq!(heap.dynamic(3), Some(first));
     }
 }
