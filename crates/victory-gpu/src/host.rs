@@ -6,7 +6,8 @@
 //! shortcut: every submission is waited for, so CPU and GPU never overlap;
 //! overlap them with per-submission fences once more than clears run.
 
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::collections::VecDeque;
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use windows::Win32::Foundation::HANDLE;
@@ -47,12 +48,18 @@ pub(crate) fn texture_state(state: u32) -> u32 {
 /// ring of host descriptors is enough.
 const RTV_RING: u32 = 1024;
 
+/// Give previously recorded indirect work time to consume a replaced view.
+const RETIRE_FENCES: u64 = 3;
+
 pub(crate) struct Host {
     pub(crate) device: ID3D12Device,
     queue: ID3D12CommandQueue,
     fence: ID3D12Fence,
     /// The last value signalled on `fence`, behind the submission lock.
     submitted: Mutex<u64>,
+    /// The current fence value, visible to recording threads.
+    submitting: AtomicU64,
+    retired: Mutex<VecDeque<(u64, ID3D12Resource)>>,
     event: HANDLE,
     rtvs: ID3D12DescriptorHeap,
     rtv_size: u32,
@@ -260,6 +267,8 @@ fn create() -> windows::core::Result<Host> {
             queue,
             fence,
             submitted: Mutex::new(0),
+            submitting: AtomicU64::new(0),
+            retired: Mutex::default(),
             event,
             rtvs,
             rtv_size,
@@ -635,6 +644,23 @@ impl Host {
         }
     }
 
+    /// Holds a replaced descriptor's resource past the current submission.
+    /// A shader can access the old view through a directly indexed heap.
+    pub(crate) fn retire_resource(&self, resource: ID3D12Resource) {
+        let mut retired = self.retired.lock().unwrap_or_else(|e| e.into_inner());
+        let fence = self.submitting.load(Ordering::Acquire) + RETIRE_FENCES;
+        retired.push_back((fence, resource));
+    }
+
+    fn release_retired(&self, fence: u64) {
+        let ready = {
+            let mut retired = self.retired.lock().unwrap_or_else(|e| e.into_inner());
+            let count = retired.partition_point(|(after, _)| *after <= fence);
+            retired.drain(..count).collect::<Vec<_>>()
+        };
+        drop(ready);
+    }
+
     /// Runs closed lists and waits for them.
     pub(crate) fn execute(&self, runs: &[&HostList]) {
         // One submission at a time from preparation to copy-back: snapshots
@@ -673,6 +699,7 @@ impl Host {
         let mut completed = true;
         for (i, group) in groups.iter().enumerate() {
             *submitted += 1;
+            self.submitting.store(*submitted, Ordering::Release);
             let started = std::time::Instant::now();
             #[cfg(feature = "diagnostics")]
             if timing() {
@@ -777,6 +804,9 @@ impl Host {
             for &(at, what, bytes) in &deferred.writes {
                 what.write(at as *mut u8, bytes);
             }
+        }
+        if completed {
+            self.release_retired(*submitted);
         }
         self.log_messages();
     }
@@ -2787,6 +2817,29 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
 #[cfg(test)]
 mod device_tests {
     use super::*;
+
+    #[test]
+    #[ignore = "needs a D3D12 device"]
+    fn replaced_resource_survives_until_the_retirement_fence() {
+        let host = create().expect("D3D12 device");
+        let resource = target(&host);
+        let raw = resource.as_raw();
+        host.retire_resource(resource);
+        let retained = || {
+            host.retired
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(_, resource)| resource.as_raw() == raw)
+        };
+        let list = host.new_list().unwrap();
+        list.close();
+        for completed in 1..=RETIRE_FENCES {
+            assert!(retained());
+            host.execute(&[&list]);
+            assert_eq!(retained(), completed < RETIRE_FENCES);
+        }
+    }
 
     #[test]
     #[ignore = "needs a D3D12 device and repeats large host copies"]
