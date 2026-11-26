@@ -208,6 +208,11 @@ pub(crate) struct Module {
 }
 
 impl Module {
+    #[cfg(test)]
+    pub(crate) fn function_names(&self) -> Vec<String> {
+        self.funcs.iter().map(|func| func.name.clone()).collect()
+    }
+
     fn ty(&mut self, def: TypeDef) -> Ty {
         if let Some(&t) = self.type_ids.get(&def) {
             return Ty(t);

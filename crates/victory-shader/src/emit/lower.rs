@@ -40,6 +40,8 @@ pub(crate) struct Lowered {
     /// Test builds: the property words of each handle annotation, in order.
     #[cfg(test)]
     pub annotations: Vec<(u32, u32)>,
+    #[cfg(test)]
+    pub functions: Vec<String>,
 }
 
 pub(crate) struct Parts<'a> {
@@ -1922,6 +1924,8 @@ impl<'a> Lower<'a> {
         Ok(Lowered {
             #[cfg(test)]
             annotations: std::mem::take(&mut self.s.annotations),
+            #[cfg(test)]
+            functions: self.s.m.function_names(),
             cmp_samplers,
             root_cbvs,
             root_srvs,

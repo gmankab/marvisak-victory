@@ -606,6 +606,88 @@ mod tests {
         assert_eq!(c[4..20], ours[..], "our hash differs from the validator's");
     }
 
+    #[test]
+    fn pixel_first_lane_includes_the_helper_selection() {
+        let words: [u32; 5] = [
+            0x7e04_0500, // v_readfirstlane_b32 s2, v0
+            0x7e06_0202, // v_mov_b32 v3, s2
+            0xf800_180f, // exp mrt0 v3, v3, v3, v3, done, vm
+            0x0303_0303,
+            0xbf81_0000, // s_endpgm
+        ];
+        let native = NativeProgram {
+            stage: HwStage::Ps,
+            wave64: false,
+            vgprs: 8,
+            layout: vec![],
+            used: vec![],
+            io: StageIo::Ps {
+                inputs: vec![],
+                input_addr: 1 << 8, // pixel position X in v0
+                db_shader_control: 0,
+                patches: vec![],
+            },
+            code: words.iter().flat_map(|word| word.to_le_bytes()).collect(),
+        };
+        let position = SigElement {
+            name: "SV_Position".into(),
+            index: 0,
+            kind: 3,
+            comp: 9,
+            interp: 4,
+            row: Some(0),
+            col: 0,
+            cols: 4,
+            usage: 1,
+            half: false,
+        };
+        let target = SigElement {
+            name: "SV_Target".into(),
+            kind: 16,
+            interp: 0,
+            usage: 15,
+            ..position.clone()
+        };
+        let p = ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage).unwrap();
+        let io = io::raise(&p, &native).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let lowered = lower::lower(&lower::Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: vec![position],
+            outputs: vec![target],
+            prims: vec![],
+            mesh_stride: 0,
+            options: TranslateOptions::default(),
+            console_flow: false,
+        })
+        .unwrap();
+        for intrinsic in ["dx.op.isHelperLane.i1", "dx.op.waveReadLaneFirst.i32"] {
+            assert!(lowered.functions.iter().any(|name| name == intrinsic));
+        }
+        let ps = HostShader {
+            stage: native.stage,
+            dxil: lowered.dxil,
+            user_data: lowered.user_data,
+            samplers: lowered.samplers,
+            static_samplers: vec![],
+            root_cbvs: lowered.root_cbvs,
+            root_srvs: lowered.root_srvs,
+        };
+        let path = validator::Validator::default_path();
+        if let Ok(mut validator) = validator::Validator::load(path.as_deref()) {
+            validator.validate(&mut ps.dxil.clone()).unwrap();
+        }
+        if let Ok(host) = host::Host::new(false) {
+            let vs = host::stub_vs(&ps).unwrap();
+            host.pipeline(&vs, &ps).unwrap();
+        }
+    }
+
     /// A pixel shader reading channel z of an input whose element starts at
     /// w. Looking the channel up subtracted the element's first channel
     /// before checking the channel lies in it, so in a build with overflow
