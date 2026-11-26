@@ -318,7 +318,7 @@ pub struct Structured {
 
 /// Builds the per-lane form of `program`.
 pub fn structure(program: &Program) -> Result<Structured, ShaderError> {
-    let mut l = Lanes::new(program)?;
+    let mut l = Lanes::new(program, false)?;
     loop {
         let execs = l.masks_in_order();
         let cond = l.paths()?;
@@ -331,12 +331,21 @@ pub fn structure(program: &Program) -> Result<Structured, ShaderError> {
     }
 }
 
+/// Keep EXEC as each instruction's predicate and retain the raw branch test.
+/// The emitter decides each branch once for the whole console wave.
+pub(crate) fn structure_console(program: &Program) -> Result<Structured, ShaderError> {
+    let mut lanes = Lanes::new(program, true)?;
+    let execs = lanes.masks_in_order();
+    lanes.finish(&execs, &[])
+}
+
 /// A lane mask by the values of its low and high dword (both the low one in
 /// wave32).
 type Key = (Value, Value);
 
 struct Lanes<'a> {
     p: &'a Program,
+    console: bool,
     order: Vec<usize>,
     /// Reverse-postorder index per block.
     index: Vec<usize>,
@@ -388,7 +397,7 @@ struct SopMasks {
 const MAX_ROUNDS: usize = 256;
 
 impl<'a> Lanes<'a> {
-    fn new(p: &'a Program) -> Result<Self, ShaderError> {
+    fn new(p: &'a Program, console: bool) -> Result<Self, ShaderError> {
         let blocks = &p.blocks;
         let order = crate::ir::reverse_postorder(blocks);
         let mut index = vec![usize::MAX; blocks.len()];
@@ -413,6 +422,7 @@ impl<'a> Lanes<'a> {
         }
         Ok(Lanes {
             p,
+            console,
             order,
             index,
             incoming,
@@ -539,6 +549,7 @@ impl<'a> Lanes<'a> {
     ) -> Result<Structured, ShaderError> {
         let blocks = &self.p.blocks;
         let b = &mut self.b;
+        let console = self.console;
         let guards = blocks
             .iter()
             .enumerate()
@@ -551,6 +562,11 @@ impl<'a> Lanes<'a> {
                         (None, _)
                         | (_, Fields::Sop { .. } | Fields::Sopp { .. } | Fields::Smem { .. }) => {
                             None
+                        }
+                        (&Some(e), _) if console => {
+                            (e != Bool::TRUE
+                                && !matches!(inst.name(), "v_readlane_b32" | "v_writelane_b32"))
+                                .then_some(e)
                         }
                         (&Some(e), _) if b.implies(cond[n], e) => None,
                         (&Some(e), _) => Some(b.given(e, cond[n])),
@@ -566,7 +582,11 @@ impl<'a> Lanes<'a> {
                 Exit::End => LaneExit::End,
                 Exit::Indirect => LaneExit::Indirect,
                 Exit::Branch { taken, not_taken } => LaneExit::Branch {
-                    when: b.given(self.when[n].unwrap_or(Bool::FALSE), cond[n]),
+                    when: if console {
+                        self.when[n].unwrap_or(Bool::FALSE)
+                    } else {
+                        b.given(self.when[n].unwrap_or(Bool::FALSE), cond[n])
+                    },
                     taken,
                     not_taken,
                 },
@@ -697,7 +717,7 @@ impl<'a> Lanes<'a> {
         {
             return Some((m, derived));
         }
-        if !self.unresolved.contains(&id) {
+        if !self.console && !self.unresolved.contains(&id) {
             for value in [true, false] {
                 let b = &mut self.b;
                 let holds = forward.iter().all(|&(e, m)| {
@@ -961,7 +981,7 @@ impl<'a> Lanes<'a> {
                     Some(k) => self.mask(k).0,
                     None => Bool::FALSE,
                 };
-                let any = self.b.and(vcc, exec);
+                let any = if self.console { vcc } else { self.b.and(vcc, exec) };
                 if n.ends_with("nz") {
                     any
                 } else {

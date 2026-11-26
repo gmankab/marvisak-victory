@@ -528,16 +528,32 @@ mod gpu {
         expected: &[u32],
         expect_native_fail: bool,
     ) {
+        run_on_hosts_with_modes(
+            name,
+            prog,
+            groups,
+            uav_dwords,
+            expected,
+            expect_native_fail,
+            &[Wave64Mode::Emulate, Wave64Mode::Wave32],
+        );
+    }
+
+    fn run_on_hosts_with_modes(
+        name: &str,
+        prog: &NativeProgram,
+        groups: [u32; 3],
+        uav_dwords: u32,
+        expected: &[u32],
+        expect_native_fail: bool,
+        modes: &[Wave64Mode],
+    ) {
         with_hosts(|hosts| {
             for (warp_idx, host) in hosts.iter().enumerate() {
                 let Some(host) = host else {
                     continue;
                 };
                 let warp = warp_idx == 1;
-                let mut modes = vec![Wave64Mode::Emulate];
-                if host.supports_wave32() {
-                    modes.push(Wave64Mode::Wave32);
-                }
                 if expect_native_fail && !host.supports_wave64() {
                     let native = emit_cs(prog, Wave64Mode::Native).unwrap();
                     assert!(
@@ -545,7 +561,10 @@ mod gpu {
                         "{name}: Native Wave64 unexpectedly built a PSO on warp={warp}"
                     );
                 }
-                for mode in modes {
+                for &mode in modes {
+                    if mode == Wave64Mode::Wave32 && !host.supports_wave32() {
+                        continue;
+                    }
                     let shader = emit_cs(prog, mode)
                         .unwrap_or_else(|e| panic!("{name} ({mode:?}, warp={warp}): {e}"));
                     if let Ok(mut v) = super::super::validator::Validator::load(
@@ -873,6 +892,110 @@ mod gpu {
                 false,
             );
         }
+    }
+
+    #[test]
+    fn gpu_console_flow_keeps_inactive_lanes_available_to_lane_reads() {
+        for wave in [32, 64] {
+            let half = wave / 2;
+            let mut code = vec![
+                v_mov_b32(1, inline_u(1)),
+                v_cmp_gt_u32(inline_u(half), 0),
+                if wave == 64 {
+                    s_and_saveexec_b64(6, VCC)
+                } else {
+                    sop1(6, 0x3C, VCC) // s_and_saveexec_b32
+                },
+                s_cbranch_execz(3),
+            ];
+            code.extend_from_slice(&v_readlane_b32(4, 0, inline_u(half + 2)));
+            code.push(v_mov_b32(1, 4));
+            code.push(if wave == 64 {
+                s_mov_b64(EXEC_LO, 6)
+            } else {
+                s_mov_b32(EXEC_LO, 6)
+            });
+            emit_uav_store(&mut code, 1, 0);
+            code.push(S_ENDPGM);
+
+            let mut prog = make_cs_program(&code, [wave, 1, 1], 0, false);
+            prog.wave64 = wave == 64;
+            let emulated = emit_cs(&prog, Wave64Mode::Emulate).unwrap();
+            assert_eq!(psv_wave_range(&emulated), (0, u32::MAX));
+            assert_eq!(sfi0_flags(&emulated) & 0x4000, 0);
+            let expected: Vec<u32> = (0..wave)
+                .map(|id| if id < half { half + 2 } else { 1 })
+                .collect();
+            run_on_hosts_with_modes(
+                "console_flow_lane_read",
+                &prog,
+                [1, 1, 1],
+                wave,
+                &expected,
+                false,
+                &[Wave64Mode::Emulate],
+            );
+        }
+    }
+
+    #[test]
+    fn gpu_console_flow_elects_the_first_active_lane_in_a_masked_branch() {
+        let mut code = Vec::new();
+        code.extend_from_slice(&v_mbcnt_lo_u32_b32(1, NEG_ONE, inline_u(0)));
+        code.push(v_cmp_lt_u32(inline_u(16), 0));
+        code.push(sop1(6, 0x3C, VCC)); // s_and_saveexec_b32
+        code.push(s_cbranch_execz(2));
+        code.push(v_readfirstlane_b32(4, 0));
+        code.push(v_add_nc_u32(1, 4, 1));
+        code.push(s_mov_b32(EXEC_LO, 6));
+        emit_uav_store(&mut code, 1, 0);
+        code.push(S_ENDPGM);
+
+        let mut prog = make_cs_program(&code, [32, 1, 1], 0, false);
+        prog.wave64 = false;
+        let expected: Vec<u32> = (0..32).map(|id| id + if id > 16 { 17 } else { 0 }).collect();
+        run_on_hosts_with_modes(
+            "console_flow_first_lane",
+            &prog,
+            [1, 1, 1],
+            32,
+            &expected,
+            false,
+            &[Wave64Mode::Emulate],
+        );
+    }
+
+    #[test]
+    fn gpu_console_flow_loops_while_any_lane_remains_active() {
+        let mut code = vec![
+            s_mov_b32(4, inline_u(0)),
+            v_mov_b32(1, inline_u(0)),
+            v_cmp_lt_u32(inline_u(0), 0),
+            sop1(6, 0x3C, VCC), // s_and_saveexec_b32
+            s_cbranch_execz(6),
+        ];
+        code.extend_from_slice(&v_readlane_b32(4, 0, inline_u(16)));
+        code.push(v_add_nc_u32(1, inline_u(1), 1));
+        code.push(v_cmp_lt_u32(vgpr(1), 0));
+        code.push(sop2(EXEC_LO, 0x0E, EXEC_LO, VCC)); // s_and_b32
+        code.push(sopp(0x09, -6)); // s_cbranch_execnz
+        code.push(s_mov_b32(EXEC_LO, 6));
+        code.push(v_add_nc_u32(1, 4, 1));
+        emit_uav_store(&mut code, 1, 0);
+        code.push(S_ENDPGM);
+
+        let mut prog = make_cs_program(&code, [32, 1, 1], 0, false);
+        prog.wave64 = false;
+        let expected: Vec<u32> = (16..48).collect();
+        run_on_hosts_with_modes(
+            "console_flow_exec_loop",
+            &prog,
+            [1, 1, 1],
+            32,
+            &expected,
+            false,
+            &[Wave64Mode::Emulate],
+        );
     }
 
     #[test]

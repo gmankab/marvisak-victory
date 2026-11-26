@@ -167,6 +167,7 @@ fn build_cs(body: &[u32], root_srv: bool) -> HostShader {
         prims: Vec::new(),
         mesh_stride: 0,
         options: super::TranslateOptions::default(),
+        console_flow: false,
     })
     .expect("lower");
 

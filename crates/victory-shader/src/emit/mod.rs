@@ -315,7 +315,7 @@ pub fn emit_with(
         }
         _ => 0,
     };
-    let l = lower::lower(&lower::Parts {
+    let mut parts = lower::Parts {
         native,
         p,
         st,
@@ -326,7 +326,22 @@ pub fn emit_with(
         prims,
         mesh_stride,
         options,
-    })?;
+        console_flow: false,
+    };
+    let l = match lower::lower(&parts) {
+        Err(ShaderError::Unsupported { what, .. })
+            if options.wave64 == Wave64Mode::Emulate
+                && matches!(&native.io, crate::native::StageIo::Cs(cs)
+                    if cs.threads.iter().product::<u32>() <= if native.wave64 { 64 } else { 32 })
+                && lower::needs_console_flow(what) =>
+        {
+            let console = structure::structure_console(p)?;
+            parts.st = &console;
+            parts.console_flow = true;
+            lower::lower(&parts)?
+        }
+        result => result?,
+    };
     Ok(HostShader {
         stage: native.stage,
         dxil: l.dxil,

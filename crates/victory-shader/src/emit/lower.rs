@@ -54,6 +54,17 @@ pub(crate) struct Parts<'a> {
     /// Mesh: what the group id arrives multiplied by.
     pub mesh_stride: u32,
     pub options: TranslateOptions,
+    pub console_flow: bool,
+}
+
+pub(super) fn needs_console_flow(reason: Why) -> bool {
+    matches!(
+        reason,
+        "a virtual wave ballot in divergent control flow"
+            | "a cross-lane read in divergent control flow"
+            | "v_readfirstlane in divergent control flow"
+            | "a wave reduction in divergent control flow"
+    )
 }
 
 enum Stop {
@@ -780,7 +791,7 @@ impl<'a> Lower<'a> {
 
             let wave = if x.native.wave64 { 64 } else { 32 };
             let needs_fixed_wave = console_lanes || total_threads <= wave && title_lds_dwords > 0;
-            let req_mode = if x.native.wave64
+            let req_mode = if x.console_flow || x.native.wave64
                 || needs_fixed_wave && x.options.wave64 == Wave64Mode::Emulate
             {
                 x.options.wave64
@@ -812,6 +823,9 @@ impl<'a> Lower<'a> {
                         req_mode == Wave64Mode::Emulate && total_threads <= wave;
                     (uniform, val_uniform) =
                         compute_uniformity(p, x.st, x.res, &x.io.inputs, single_emulated_wave);
+                    if x.console_flow {
+                        uniform.fill(true);
+                    }
                     let has_non_uniform_firstlane = insts().any(|i| {
                         i.name() == "v_readfirstlane_b32"
                             && matches!(
@@ -826,8 +840,10 @@ impl<'a> Lower<'a> {
                             inst.name() == "v_readlane_b32" && !spills.contains_key(&(b, i))
                         })
                     });
-                    let need_emu =
-                        console_lanes || !sections.is_empty() || has_non_uniform_firstlane;
+                    let need_emu = x.console_flow
+                        || console_lanes
+                        || !sections.is_empty()
+                        || has_non_uniform_firstlane;
 
                     if req_mode == Wave64Mode::Wave32 {
                         if total_threads <= 32 {
@@ -1502,7 +1518,7 @@ impl<'a> Lower<'a> {
     /// Emits a ballot for active mask `lo` into `self.cur`.
     fn compute_ballot_in_cur(&mut self, lo: Value, uniform_here: bool) -> Result<(V, V), Why> {
         let &m = self.x.st.masks.get(&lo).ok_or(LANE_MASK)?;
-        if !self.x.st.active.contains(&lo) {
+        if !self.x.console_flow && !self.x.st.active.contains(&lo) {
             return Err("a lane mask holding lanes elsewhere read as data");
         }
         let c = self.cur;
@@ -1516,47 +1532,7 @@ impl<'a> Lower<'a> {
             if self.guard_depth > 0 || !uniform_here {
                 return Err("a virtual wave ballot in divergent control flow");
             }
-            let (_, console_lane, vwave) = self.ensure_wave_ids();
-            let base = self.ballot_base;
-            let stride = self.ballot_stride;
-            self.lds_barrier(self.cur);
-            let k0 = self.s.m.i32(0);
-            let is0 = self.s.m.cmp(self.cur, pred::EQ, console_lane, k0);
-            let at0 = self.begin_guarded(Some(is0));
-            let p0 = self.scratch_ptr(self.cur, base, stride, vwave, 0);
-            let p1 = self.scratch_ptr(self.cur, base, stride, vwave, 1);
-            self.s.m.store(self.cur, p0, k0);
-            self.s.m.store(self.cur, p1, k0);
-            self.end_guarded(at0, &[]);
-
-            self.lds_barrier(self.cur);
-            let at_bit = self.begin_guarded(Some(bit));
-            let bcur = self.cur;
-            let k32 = self.s.m.i32(32);
-            let k31 = self.s.m.i32(31);
-            let k1 = self.s.m.i32(1);
-            let half = self.s.m.cmp(bcur, pred::IUGE, console_lane, k32);
-            let half_off = self.s.m.cast(bcur, Cast::ZExt, half, self.s.t.i32);
-            let base_v = self.s.m.i32(base);
-            let stride_v = self.s.m.i32(stride);
-            let wave_off = self.s.m.bin(bcur, Bin::Mul, vwave, stride_v);
-            let slot_base = self.s.m.bin(bcur, Bin::Add, base_v, wave_off);
-            let slot_idx = self.s.m.bin(bcur, Bin::Add, slot_base, half_off);
-            let lds = self.s.lds();
-            let ptr = self.s.m.element(bcur, lds, slot_idx);
-            let sh = self.s.m.bin(bcur, Bin::And, console_lane, k31);
-            let mask_bit = self.s.m.bin(bcur, Bin::Shl, k1, sh);
-            let _ = self
-                .s
-                .m
-                .atomic(bcur, super::bitcode::Rmw::Or, ptr, mask_bit);
-            self.end_guarded(at_bit, &[]);
-
-            self.lds_barrier(self.cur);
-            let c = self.cur;
-            let p0 = self.scratch_ptr(c, base, stride, vwave, 0);
-            let p1 = self.scratch_ptr(c, base, stride, vwave, 1);
-            (self.s.m.load(c, p0), self.s.m.load(c, p1))
+            self.emulated_ballot(bit)
         } else {
             let i32t = self.s.t.i32;
             let four = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
@@ -1570,6 +1546,47 @@ impl<'a> Lower<'a> {
         };
         self.ballots.insert(lo, xy);
         Ok(xy)
+    }
+
+    fn emulated_ballot(&mut self, bit: V) -> (V, V) {
+        let (_, console_lane, vwave) = self.ensure_wave_ids();
+        let base = self.ballot_base;
+        let stride = self.ballot_stride;
+        self.lds_barrier(self.cur);
+        let k0 = self.s.m.i32(0);
+        let is0 = self.s.m.cmp(self.cur, pred::EQ, console_lane, k0);
+        let at0 = self.begin_guarded(Some(is0));
+        let p0 = self.scratch_ptr(self.cur, base, stride, vwave, 0);
+        let p1 = self.scratch_ptr(self.cur, base, stride, vwave, 1);
+        self.s.m.store(self.cur, p0, k0);
+        self.s.m.store(self.cur, p1, k0);
+        self.end_guarded(at0, &[]);
+
+        self.lds_barrier(self.cur);
+        let at_bit = self.begin_guarded(Some(bit));
+        let c = self.cur;
+        let k32 = self.s.m.i32(32);
+        let k31 = self.s.m.i32(31);
+        let k1 = self.s.m.i32(1);
+        let half = self.s.m.cmp(c, pred::IUGE, console_lane, k32);
+        let half_off = self.s.m.cast(c, Cast::ZExt, half, self.s.t.i32);
+        let base_v = self.s.m.i32(base);
+        let stride_v = self.s.m.i32(stride);
+        let wave_off = self.s.m.bin(c, Bin::Mul, vwave, stride_v);
+        let slot_base = self.s.m.bin(c, Bin::Add, base_v, wave_off);
+        let slot_idx = self.s.m.bin(c, Bin::Add, slot_base, half_off);
+        let lds = self.s.lds();
+        let ptr = self.s.m.element(c, lds, slot_idx);
+        let sh = self.s.m.bin(c, Bin::And, console_lane, k31);
+        let mask_bit = self.s.m.bin(c, Bin::Shl, k1, sh);
+        self.s.m.atomic(c, super::bitcode::Rmw::Or, ptr, mask_bit);
+        self.end_guarded(at_bit, &[]);
+
+        self.lds_barrier(self.cur);
+        let c = self.cur;
+        let p0 = self.scratch_ptr(c, base, stride, vwave, 0);
+        let p1 = self.scratch_ptr(c, base, stride, vwave, 1);
+        (self.s.m.load(c, p0), self.s.m.load(c, p1))
     }
 
     /// An instruction inside a whole-wave section: the values that leave
@@ -3157,14 +3174,17 @@ impl<'a> Lower<'a> {
                 return Err("an LDS read of bytes or halves");
             };
             let reg = dst_reg.ok_or("an LDS read result")?;
-            let mut n = 0;
+            let at = self.begin_guarded(if self.x.console_flow { guard } else { None });
+            let mut results = Vec::new();
+            let zero = self.s.m.i32(0);
             for (off, w) in elements {
                 for k in 0..w {
                     let p = dword(self, off + 4 * k);
-                    let x = self.s.m.load(self.cur, p);
-                    self.write(inst, Reg::V(reg + n), x, guard);
-                    n += 1;
+                    results.push((self.s.m.load(self.cur, p), zero));
                 }
+            }
+            for (n, x) in self.end_guarded(at, &results).into_iter().enumerate() {
+                self.write(inst, Reg::V(reg + n as u8), x, guard);
             }
             return Ok(());
         }
@@ -4382,6 +4402,9 @@ impl<'a> Lower<'a> {
                     }
                     _ => Err("a root UAV or typed root view"),
                 }
+            }
+            Source::Phi { .. } if self.x.console_flow => {
+                Err("a descriptor chosen by control flow in an emulated console wave")
             }
             Source::Phi { block, args } => {
                 // Each predecessor computes its heap index at its end; the
@@ -7548,6 +7571,29 @@ impl<'a> Lower<'a> {
         }
     }
 
+    fn console_branch(&mut self, name: &str, when: Bool) -> Result<V, Why> {
+        if matches!(when, Bool::TRUE | Bool::FALSE) {
+            return Ok(self.s.m.bool(when == Bool::TRUE));
+        }
+        let branch_on_empty = match name {
+            "s_cbranch_execz" | "s_cbranch_vccz" | "s_cbranch_scc0" => true,
+            "s_cbranch_execnz" | "s_cbranch_vccnz" | "s_cbranch_scc1" => false,
+            _ => return Err("an unsupported branch in an emulated console wave"),
+        };
+        let c = self.cur;
+        let mut bit = self.boolean(when, c)?;
+        let true_value = self.s.m.bool(true);
+        if branch_on_empty {
+            bit = self.s.m.bin(c, Bin::Xor, bit, true_value);
+        }
+        let (lo, hi) = self.emulated_ballot(bit);
+        let c = self.cur;
+        let any = self.s.m.bin(c, Bin::Or, lo, hi);
+        let zero = self.s.m.i32(0);
+        let predicate = if branch_on_empty { pred::EQ } else { pred::NE };
+        Ok(self.s.m.cmp(c, predicate, any, zero))
+    }
+
     fn exit(&mut self, b: usize) -> Result<(), Stop> {
         if self.emulating_wave()
             && let LaneExit::Branch { when, .. } = self.x.st.exits[b]
@@ -7593,18 +7639,25 @@ impl<'a> Lower<'a> {
                 not_taken,
             } => {
                 // A negated condition branches the other way round.
-                let (cond, taken, not_taken) = match self.x.st.bools.node(when) {
-                    Some((atom, Bool::TRUE, Bool::FALSE)) => {
-                        let a = self
-                            .atom(atom, self.cur)
-                            .map_err(|w| unsupported(offset, w))?;
-                        (a, not_taken, taken)
-                    }
-                    _ => {
-                        let c = self
-                            .boolean(when, self.cur)
-                            .map_err(|w| unsupported(offset, w))?;
-                        (c, taken, not_taken)
+                let (cond, taken, not_taken) = if self.x.console_flow {
+                    let name = self.x.p.blocks[b].insts.last().map_or("", Inst::name);
+                    let cond = self.console_branch(name, when).map_err(|w| unsupported(offset, w))?;
+                    self.tail[b] = Some(self.cur);
+                    (cond, taken, not_taken)
+                } else {
+                    match self.x.st.bools.node(when) {
+                        Some((atom, Bool::TRUE, Bool::FALSE)) => {
+                            let a = self
+                                .atom(atom, self.cur)
+                                .map_err(|w| unsupported(offset, w))?;
+                            (a, not_taken, taken)
+                        }
+                        _ => {
+                            let c = self
+                                .boolean(when, self.cur)
+                                .map_err(|w| unsupported(offset, w))?;
+                            (c, taken, not_taken)
+                        }
                     }
                 };
                 // A back edge is taken only below the iteration limit.
@@ -7802,6 +7855,7 @@ mod tests {
             prims: vec![],
             mesh_stride: 0,
             options: super::TranslateOptions::default(),
+            console_flow: false,
         })
         .map(|_| ())
     }
@@ -7928,6 +7982,7 @@ mod tests {
             prims: vec![],
             mesh_stride: 0,
             options: Default::default(),
+            console_flow: false,
         })
         .unwrap();
 
