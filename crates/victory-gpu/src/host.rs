@@ -10070,15 +10070,18 @@ impl Host {
                 ),
             ]);
             list.CopyResource(&back, texture);
-            // The frame rate, into the corner of what is shown (not of the
-            // title's own frame, which the lines below read back).
+            // Add the optional frame-rate panel before the title's overlay.
             crate::fpsbox::draw(self, list, &back, (width, height, format));
             #[cfg(feature = "diagnostics")]
-            let capture = crate::capture::wanted(frame)
-                .then(|| crate::capture::read_back(&self.device, list, texture))
-                .flatten();
+            let read_back = |image: &ID3D12Resource| {
+                let capture = crate::capture::wanted(frame)
+                    .then(|| crate::capture::read_back(&self.device, list, image))
+                    .flatten();
+                let probe = slot.is_none().then(|| crate::capture::probe(&self.device, list, image)).flatten();
+                (capture, probe)
+            };
             #[cfg(feature = "diagnostics")]
-            let probe = if slot.is_some() { None } else { crate::capture::probe(&self.device, list, texture) };
+            let (capture, probe);
             #[cfg(not(feature = "diagnostics"))]
             let _ = frame;
             // The present's second plane, if it has one, goes over the copy
@@ -10089,7 +10092,6 @@ impl Host {
                 let format = swap_format(plane.GetDesc().Format)?;
                 Some((plane, D3D12_RESOURCE_STATES(was as i32), format))
             });
-            let mut drawn = false;
             if let Some((plane, was, plane_format)) = over {
                 let mut barriers = vec![
                     transition(texture, D3D12_RESOURCE_STATE_COPY_SOURCE, state),
@@ -10104,7 +10106,7 @@ impl Host {
                     barriers.push(transition(plane, was, readable));
                 }
                 list.ResourceBarrier(&barriers);
-                drawn = crate::over::record(
+                crate::over::record(
                     &self.device,
                     list,
                     &back,
@@ -10113,9 +10115,25 @@ impl Host {
                     plane,
                     plane_format,
                 );
+                let read_composed = cfg!(feature = "diagnostics") && slot.is_none();
+                let back_state = if read_composed {
+                    D3D12_RESOURCE_STATE_COPY_SOURCE
+                } else {
+                    D3D12_RESOURCE_STATE_RENDER_TARGET
+                };
+                #[cfg(feature = "diagnostics")]
+                {
+                    (capture, probe) = if read_composed {
+                        // The interface can be the entire picture in Series S.
+                        list.ResourceBarrier(&[transition(&back, D3D12_RESOURCE_STATE_RENDER_TARGET, back_state)]);
+                        read_back(&back)
+                    } else {
+                        (None, None)
+                    };
+                }
                 let mut barriers = vec![transition(
                     &back,
-                    D3D12_RESOURCE_STATE_RENDER_TARGET,
+                    back_state,
                     D3D12_RESOURCE_STATE_PRESENT,
                 )];
                 if moved {
@@ -10123,6 +10141,10 @@ impl Host {
                 }
                 list.ResourceBarrier(&barriers);
             } else {
+                #[cfg(feature = "diagnostics")]
+                {
+                    (capture, probe) = read_back(texture);
+                }
                 list.ResourceBarrier(&[
                     transition(texture, D3D12_RESOURCE_STATE_COPY_SOURCE, state),
                     transition(
@@ -10132,7 +10154,6 @@ impl Host {
                     ),
                 ]);
             }
-            let _ = drawn;
             copy.close();
             match slot {
                 Some(i) => {
