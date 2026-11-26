@@ -555,6 +555,7 @@ struct Deferred {
     /// Buffer ranges refreshed since the last title copy (host copy,
     /// address, bytes): refreshing them again would find the same bytes.
     refreshed: std::collections::HashSet<(usize, usize, usize)>,
+    refresh_epoch: u64,
     /// Which textures this list starts from title memory or writes on the GPU.
     texture_uses: std::collections::HashMap<usize, TextureUse>,
     /// Host buffers that earlier shaders in this list used as UAVs.
@@ -1290,6 +1291,11 @@ impl HostList {
             .copies
             .push(Step::Copy(dst as usize, src as usize, len));
         deferred.refreshed.clear();
+        deferred.refresh_epoch = deferred.refresh_epoch.wrapping_add(1);
+    }
+
+    pub(crate) fn refresh_epoch(&self) -> u64 {
+        self.deferred().refresh_epoch
     }
 
     /// Copies `len` bytes of title memory at `src` into the list's upload
@@ -1492,8 +1498,10 @@ impl HostList {
     /// Runs `work` when the list is submitted, in order with its copies.
     /// `work` may write title memory (refreshes after it copy again).
     pub(crate) fn defer(&self, work: impl Fn() + Send + 'static) {
-        self.deferred().copies.push(Step::Run(Box::new(work)));
-        self.deferred().refreshed.clear();
+        let mut deferred = self.deferred();
+        deferred.copies.push(Step::Run(Box::new(work)));
+        deferred.refreshed.clear();
+        deferred.refresh_epoch = deferred.refresh_epoch.wrapping_add(1);
     }
 
     /// As [`HostList::defer`], for work that writes only host memory.

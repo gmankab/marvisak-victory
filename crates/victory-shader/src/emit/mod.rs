@@ -87,6 +87,8 @@ mod shader;
 pub mod validator;
 #[cfg(test)]
 mod valu_tests;
+#[cfg(test)]
+mod view_stride_tests;
 mod wave;
 #[cfg(test)]
 mod wave64_tests;
@@ -97,6 +99,10 @@ use crate::{ShaderError, io, ir, resource, structure};
 
 pub use sampler::StaticSampler;
 pub use shader::{ROOT_CBV_SPACE, SAMPLER_SPACE, USER_DATA_SPACE};
+
+/// Host root SRV containing the number of heap slots, then each buffer
+/// SRV's byte stride plus one. Zero marks slots without a buffer SRV.
+pub const VIEW_STRIDES: u8 = u8::MAX;
 
 /// The stack for threads that make host pipelines from translated shaders.
 /// vkd3d-proton converts DXIL on the calling thread, recursively over its
