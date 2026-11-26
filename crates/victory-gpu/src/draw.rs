@@ -1179,6 +1179,55 @@ fn readable(list: &HostList, u: &UsedResource, view: &View) {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::descriptor;
+
+    #[test]
+    fn exhausted_dynamic_slots_report_a_failed_table() {
+        let Some(host) = crate::host::host() else {
+            eprintln!("no host D3D12 device; skipped");
+            return;
+        };
+        let title_heap = descriptor::tests::shader_visible_view_heap(4);
+        let heap = descriptor::heap(title_heap);
+        let host_heap = heap.host().unwrap();
+        // SAFETY: the shader-visible heap is live throughout the test.
+        let capacity = unsafe { host_heap.heap.GetDesc().NumDescriptors } - host_heap.count();
+        let reservation = host_heap.dynamic(capacity).unwrap();
+        let mut state = State::default();
+        state.set_heaps(&[title_heap]);
+        state.compute.push(Root::Table(heap.start));
+        let constants = [7u32; 4];
+        let address = constants.as_ptr() as u64;
+        let cbv = [address as u32, (address >> 32) as u32, 16, 0];
+        descriptor::create_cbv(std::ptr::null(), &cbv, heap.start);
+        let used = [UsedResource {
+            kind: ResourceType::Cbv,
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 4,
+            user_data: 0,
+            slot: 0,
+        }];
+        let list = host.new_list().unwrap();
+        assert!(state.tables(&list, &used, true).is_empty());
+        assert!(state.table_failed);
+
+        host_heap.release(reservation, capacity);
+        state.table_failed = false;
+        assert_eq!(state.tables(&list, &used, true), [(0, reservation * 32)]);
+        assert!(!state.table_failed);
+
+        list.close();
+        drop(state);
+        crate::object::slot::<extern "win64" fn(This) -> u32>(title_heap, 0x10)(title_heap);
+    }
+}
+
 /// A view in a few words (diagnostics builds).
 #[cfg(feature = "diagnostics")]
 fn describe(view: Option<&View>) -> String {
