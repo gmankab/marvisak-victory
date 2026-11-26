@@ -830,28 +830,35 @@ mod gpu {
     }
 
     #[test]
-    fn gpu_64_threads_lockstep_lds_without_s_barrier() {
-        // 64 threads sharing LDS without `s_barrier` (assumes single Wave64 wave on console).
-        let mut code = Vec::new();
-        code.push(v_lshlrev_b32(2, inline_u(2), 0)); // write addr = tid * 4
-        code.push(v_add_nc_u32(3, inline_u(7), 0)); // val = tid + 7
-        code.extend_from_slice(&ds_op(0x0D, 0, 0, 2, 3, 0)); // ds_write_b32 addr=v2, data=v3
-        code.push(vop2(0x1D, 4, inline_u(32), 0)); // partner = tid ^ 32 (crosses Wave32 half!)
-        code.push(v_lshlrev_b32(4, inline_u(2), 4)); // read addr = partner * 4
-        code.extend_from_slice(&ds_op(0x36, 0, 0, 4, 0, 1)); // ds_read_b32 v1, addr=v4
-        emit_uav_store(&mut code, 1, 0);
-        code.push(S_ENDPGM);
+    fn gpu_one_wave_lockstep_lds_without_s_barrier() {
+        for threads in [32u32, 64] {
+            let partner_bit = threads / 2;
+            let mut code = Vec::new();
+            code.push(v_lshlrev_b32(2, inline_u(2), 0));
+            code.push(v_add_nc_u32(3, inline_u(7), 0));
+            code.extend_from_slice(&ds_op(0x0D, 0, 0, 2, 3, 0));
+            code.push(vop2(0x1D, 4, inline_u(partner_bit), 0));
+            code.push(v_lshlrev_b32(4, inline_u(2), 4));
+            code.extend_from_slice(&ds_op(0x36, 0, 0, 4, 0, 1));
+            emit_uav_store(&mut code, 1, 0);
+            code.push(S_ENDPGM);
 
-        let prog = make_cs_program(&code, [64, 1, 1], 512, false);
-        let expected: Vec<u32> = (0..64u32).map(|i| (i ^ 32) + 7).collect();
-        run_on_hosts(
-            "lockstep_lds_no_barrier",
-            &prog,
-            [1, 1, 1],
-            64,
-            &expected,
-            false,
-        );
+            let mut prog = make_cs_program(&code, [threads, 1, 1], 512, false);
+            prog.wave64 = threads == 64;
+            let native = emit_cs(&prog, Wave64Mode::Native).unwrap();
+            let emulated = emit_cs(&prog, Wave64Mode::Emulate).unwrap();
+            assert_eq!(psv_wave_range(&native), (threads, threads));
+            assert_eq!(psv_wave_range(&emulated), (0, u32::MAX));
+            let expected: Vec<u32> = (0..threads).map(|i| (i ^ partner_bit) + 7).collect();
+            run_on_hosts(
+                &format!("lockstep_lds_{threads}_threads"),
+                &prog,
+                [1, 1, 1],
+                threads,
+                &expected,
+                false,
+            );
+        }
     }
 
     #[test]

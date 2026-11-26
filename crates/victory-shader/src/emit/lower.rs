@@ -791,8 +791,28 @@ impl<'a> Lower<'a> {
             match req_mode {
                 Wave64Mode::Native => {
                     let wave = if x.native.wave64 { 64 } else { 32 };
-                    let one_wave = total_threads <= wave;
-                    if console_lanes || one_wave && title_lds_dwords > 0 {
+                    let single_wave_lds = total_threads <= wave && title_lds_dwords > 0;
+                    let barrier_candidate = wave == 32
+                        && x.options.wave64 == Wave64Mode::Emulate
+                        && single_wave_lds
+                        && !console_lanes
+                        && !has_s_barrier
+                        && sections.is_empty()
+                        && !insts().any(|i| i.name() == "v_readfirstlane_b32");
+                    if barrier_candidate {
+                        (uniform, val_uniform) = compute_uniformity(p, x.st, x.res, &x.io.inputs);
+                        let safe_barriers = p.blocks.iter().enumerate().all(|(b, block)| {
+                            block.insts.iter().enumerate().all(|(i, inst)| {
+                                !matches!(inst.fields, Fields::Ds { .. })
+                                    || uniform[b] && x.st.guards[b][i].is_none()
+                            })
+                        });
+                        if safe_barriers {
+                            need_lds_barriers = total_threads > 1 && has_lds_mem;
+                        } else {
+                            s.wave_size = Some(wave);
+                        }
+                    } else if console_lanes || single_wave_lds {
                         s.wave_size = Some(wave);
                     }
                 }
