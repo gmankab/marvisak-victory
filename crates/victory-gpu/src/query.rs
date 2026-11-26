@@ -4,6 +4,7 @@
 //! time.
 
 use std::collections::HashMap;
+use std::ops::Range;
 use std::sync::{Arc, Mutex};
 
 use windows::Win32::Graphics::Direct3D12::{
@@ -88,12 +89,16 @@ fn host_type(kind: u32) -> D3D12_QUERY_TYPE {
     }
 }
 
-/// A host query slot for one Begin/End, distinct from other pairs of the same
-/// title index in this recording. Slots of a kind are resolved in batches.
+/// A host query slot for one interval with an unchanged set of title queries.
 #[derive(Clone, Copy)]
 struct Slot {
     kind: u32,
     number: usize,
+}
+
+struct OpenQuery {
+    kind: u32,
+    first: usize,
     missed: u64,
 }
 
@@ -156,7 +161,7 @@ impl Chunk {
 
 enum Event {
     Begin(Arc<Samples>, u32),
-    End(Arc<Samples>, u32, Slot),
+    End(Arc<Samples>, u32, u32, Range<usize>),
     Resolve(Option<Arc<Samples>>, u32, u32, u32, usize),
 }
 
@@ -165,7 +170,10 @@ enum Event {
 /// order, including when it records the resolve on a different thread/list.
 #[derive(Default)]
 pub(crate) struct Recording {
-    open: HashMap<(usize, u32), Slot>,
+    open: HashMap<(usize, u32), OpenQuery>,
+    precise_queries: usize,
+    active: Option<Slot>,
+    slots: Vec<Slot>,
     events: Vec<Event>,
     chunks: [Vec<Chunk>; 2],
     used: [usize; 2],
@@ -192,37 +200,77 @@ impl Recording {
             if self.open.contains_key(&key) {
                 return;
             }
+            self.end_segment(list);
             self.events.push(Event::Begin(samples, index));
-            let used = &mut self.used[kind as usize];
-            let chunks = &mut self.chunks[kind as usize];
-            let chunk = *used / CHUNK_SIZE;
-            if chunk == chunks.len() {
-                let Some(new) = crate::host::host().and_then(Chunk::new) else {
-                    return;
-                };
-                chunks.push(new);
-            }
-            let slot = Slot {
-                kind,
-                number: *used,
-                missed: self.missed,
-            };
-            let chunk = &chunks[chunk];
-            // SAFETY: this open list owns this unused host slot.
-            unsafe { list.BeginQuery(&chunk.heap, host_type(kind), (*used % CHUNK_SIZE) as u32) };
-            *used += 1;
-            self.open.insert(key, slot);
+            self.open.insert(
+                key,
+                OpenQuery {
+                    kind,
+                    first: self.slots.len(),
+                    missed: self.missed,
+                },
+            );
+            self.precise_queries += usize::from(kind == OCCLUSION);
+            self.begin_segment(list);
         } else if self.open.get(&key).is_some_and(|slot| slot.kind == kind) {
-            let slot = self.open.remove(&key).unwrap();
-            Self::end(list, &self.chunks, slot);
-            if self.missed == slot.missed {
-                self.events.push(Event::End(samples, index, slot));
+            let query = self.open.remove(&key).unwrap();
+            self.end_segment(list);
+            if self.missed == query.missed {
+                self.events.push(Event::End(
+                    samples,
+                    index,
+                    kind,
+                    query.first..self.slots.len(),
+                ));
             }
+            self.precise_queries -= usize::from(kind == OCCLUSION);
+            self.begin_segment(list);
         }
     }
 
-    fn end(list: &ID3D12GraphicsCommandList, chunks: &[Vec<Chunk>; 2], slot: Slot) {
-        let chunk = &chunks[slot.kind as usize][slot.number / CHUNK_SIZE];
+    fn begin_segment(&mut self, list: &ID3D12GraphicsCommandList) {
+        if self.open.is_empty() {
+            return;
+        }
+        // Vulkan allows one active occlusion query. A count also answers
+        // any binary queries open over the same interval.
+        let kind = if self.precise_queries != 0 {
+            OCCLUSION
+        } else {
+            BINARY
+        };
+        let used = &mut self.used[kind as usize];
+        let chunks = &mut self.chunks[kind as usize];
+        let chunk = *used / CHUNK_SIZE;
+        if chunk == chunks.len() {
+            let Some(new) = crate::host::host().and_then(Chunk::new) else {
+                self.missed += 1;
+                return;
+            };
+            chunks.push(new);
+        }
+        let slot = Slot {
+            kind,
+            number: *used,
+        };
+        // SAFETY: the previous segment ended and this list owns the new slot.
+        unsafe {
+            list.BeginQuery(
+                &chunks[chunk].heap,
+                host_type(kind),
+                (*used % CHUNK_SIZE) as u32,
+            )
+        };
+        *used += 1;
+        self.slots.push(slot);
+        self.active = Some(slot);
+    }
+
+    fn end_segment(&mut self, list: &ID3D12GraphicsCommandList) {
+        let Some(slot) = self.active.take() else {
+            return;
+        };
+        let chunk = &self.chunks[slot.kind as usize][slot.number / CHUNK_SIZE];
         // SAFETY: the host begin for this slot was recorded on this list.
         unsafe {
             list.EndQuery(
@@ -248,11 +296,11 @@ impl Recording {
     }
 
     pub(crate) fn close(&mut self, list: &ID3D12GraphicsCommandList) {
-        // Complete any abandoned host query so its slot is safe to resolve.
+        // Complete any last segment for queries the title left open.
         // No End event means the title sees the visible fallback for it.
-        for (_, slot) in self.open.drain() {
-            Self::end(list, &self.chunks, slot);
-        }
+        self.end_segment(list);
+        self.open.clear();
+        self.precise_queries = 0;
         for (kind, chunks) in self.chunks.iter().enumerate() {
             let mut remaining = self.used[kind];
             for chunk in chunks.iter().take(remaining.div_ceil(CHUNK_SIZE)) {
@@ -304,17 +352,31 @@ impl Recording {
                         .unwrap_or_else(|e| e.into_inner())
                         .remove(index);
                 }
-                Event::End(samples, index, slot) => {
-                    let chunk = &self.chunks[slot.kind as usize][slot.number / CHUNK_SIZE];
-                    if waited && chunk.available {
-                        let value = chunk.values[slot.number % CHUNK_SIZE];
+                Event::End(samples, index, kind, slots) if waited => {
+                    let measured =
+                        self.slots[slots.clone()]
+                            .iter()
+                            .try_fold(0u64, |total, slot| {
+                                let chunk =
+                                    &self.chunks[slot.kind as usize][slot.number / CHUNK_SIZE];
+                                chunk.available.then(|| {
+                                    total.saturating_add(chunk.values[slot.number % CHUNK_SIZE])
+                                })
+                            });
+                    if let Some(value) = measured {
+                        let value = if *kind == BINARY {
+                            u64::from(value != 0)
+                        } else {
+                            value
+                        };
                         samples
                             .0
                             .lock()
                             .unwrap_or_else(|e| e.into_inner())
-                            .insert(*index, (slot.kind, value));
+                            .insert(*index, (*kind, value));
                     }
                 }
+                Event::End(..) => {}
                 Event::Resolve(samples, kind, first, count, dst) => {
                     let values = samples
                         .as_ref()

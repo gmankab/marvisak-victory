@@ -2804,6 +2804,114 @@ mod device_tests {
         texture.unwrap()
     }
 
+    #[cfg(feature = "diagnostics")]
+    #[test]
+    #[ignore = "requires a D3D12 device and DXC"]
+    fn overlapping_queries_keep_each_draw_range() {
+        use crate::query::{BINARY, OCCLUSION};
+        use windows::Win32::Foundation::RECT;
+        use windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
+
+        let host = host().expect("D3D12 device");
+        let source = r#"
+            [RootSignature("")]
+            float4 vs(uint id : SV_VertexID) : SV_Position {
+                return float4(id == 1 ? 3 : -1, id == 2 ? -3 : 1, 0, 1);
+            }
+            float4 ps() : SV_Target { return 1; }
+        "#;
+        let compile = |entry, profile| {
+            let result = victory_shader::hostlib::compile_hlsl(source, entry, profile);
+            victory_loader::linux::signals::reclaim();
+            result.unwrap()
+        };
+        let vs = compile("vs", "vs_6_0");
+        let ps = compile("ps", "ps_6_0");
+        let code = |bytes: &[u8]| D3D12_SHADER_BYTECODE {
+            pShaderBytecode: bytes.as_ptr().cast(),
+            BytecodeLength: bytes.len(),
+        };
+        let mut formats = [DXGI_FORMAT_UNKNOWN; 8];
+        formats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+        let mut blend = D3D12_BLEND_DESC::default();
+        blend.RenderTarget[0].RenderTargetWriteMask = 0xf;
+        let texture = target(host);
+        let list = host.new_list().unwrap();
+        // SAFETY: creation borrows the bytecode and root pointer only for the call.
+        let (root, pipeline): (ID3D12RootSignature, ID3D12PipelineState) = unsafe {
+            let root = host.device.CreateRootSignature(0, &vs).unwrap();
+            let pipeline = host.device.CreateGraphicsPipelineState(
+                &D3D12_GRAPHICS_PIPELINE_STATE_DESC {
+                    pRootSignature: std::mem::transmute_copy(&root),
+                    VS: code(&vs),
+                    PS: code(&ps),
+                    BlendState: blend,
+                    SampleMask: u32::MAX,
+                    RasterizerState: D3D12_RASTERIZER_DESC {
+                        FillMode: D3D12_FILL_MODE_SOLID,
+                        CullMode: D3D12_CULL_MODE_NONE,
+                        DepthClipEnable: true.into(),
+                        ..Default::default()
+                    },
+                    PrimitiveTopologyType: D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
+                    NumRenderTargets: 1,
+                    RTVFormats: formats,
+                    SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                    ..Default::default()
+                },
+            ).unwrap();
+            (root, pipeline)
+        };
+        // SAFETY: the list and the resources it names live through submission.
+        unsafe {
+            list.list.OMSetRenderTargets(1, Some(&host.rtv(&texture, None)), false, None);
+            list.list.SetGraphicsRootSignature(&root);
+            list.list.SetPipelineState(&pipeline);
+            list.list.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            list.list.RSSetViewports(&[D3D12_VIEWPORT {
+                Width: 4.0,
+                Height: 4.0,
+                MaxDepth: 1.0,
+                ..Default::default()
+            }]);
+        }
+        let draw = |width| {
+            // SAFETY: a scissor within the 4x4 target and an open list.
+            unsafe {
+                list.list.RSSetScissorRects(&[RECT {
+                    left: 0, top: 0, right: width, bottom: 4,
+                }]);
+                list.list.DrawInstanced(3, 1, 0, 0);
+            }
+        };
+        let counts = crate::query::occlusion_for_test(0, 2).unwrap();
+        let binary = crate::query::occlusion_for_test(0, 2).unwrap();
+        list.mark_query(counts, OCCLUSION, 0, true);
+        draw(4);
+        list.mark_query(binary, BINARY, 0, true);
+        list.mark_query(counts, OCCLUSION, 1, true);
+        draw(1);
+        list.mark_query(counts, OCCLUSION, 0, false);
+        draw(2);
+        list.mark_query(counts, OCCLUSION, 1, false);
+        list.mark_query(binary, BINARY, 0, false);
+        list.mark_query(binary, BINARY, 1, true);
+        draw(4);
+        list.mark_query(binary, BINARY, 1, false);
+
+        let mut counts_result = [u64::MAX; 2];
+        let mut binary_result = [u64::MAX; 2];
+        list.resolve_queries(counts, OCCLUSION, 0, 2, counts_result.as_mut_ptr().cast());
+        list.resolve_queries(binary, BINARY, 0, 2, binary_result.as_mut_ptr().cast());
+        list.close();
+        host.execute(&[&list]);
+        for heap in [counts, binary] {
+            crate::object::slot::<extern "win64" fn(crate::object::This) -> u32>(heap, 0x10)(heap);
+        }
+        assert_eq!(counts_result, [20, 12]);
+        assert_eq!(binary_result, [1, 1]);
+    }
+
     /// Records a clear of `texture` (a render target) to `color`.
     fn clear(host: &Host, list: &HostList, texture: &ID3D12Resource, color: [f32; 4]) {
         // SAFETY: a live device, list and texture; the view's heap lives
