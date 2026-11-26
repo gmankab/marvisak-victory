@@ -488,6 +488,7 @@ fn compute_uniformity(
     st: &Structured,
     res: &Resources,
     io_inputs: &[(Value, Input)],
+    single_emulated_wave: bool,
 ) -> (Vec<bool>, Vec<bool>) {
     let n = p.blocks.len();
     let max_v = p
@@ -582,9 +583,12 @@ fn compute_uniformity(
                     && !iname.starts_with("s_bcnt")
                     && !iname.starts_with("s_ff1")
                     && !iname.contains("saveexec");
+                // One virtual wave shares its selected lane across the whole group.
+                let wave_broadcast = single_emulated_wave && iname == "v_readfirstlane_b32";
                 let reads_ok = blk_ok
-                    && scalar_op
-                    && inst.reads.iter().all(|&(_, v)| val_uniform[v.0 as usize]);
+                    && (wave_broadcast
+                        || scalar_op
+                            && inst.reads.iter().all(|&(_, v)| val_uniform[v.0 as usize]));
                 for &(_, w) in &inst.writes {
                     if val_uniform[w.0 as usize] && !reads_ok {
                         val_uniform[w.0 as usize] = false;
@@ -804,7 +808,10 @@ impl<'a> Lower<'a> {
                 }
                 Wave64Mode::Wave32 | Wave64Mode::Emulate => {
                     spills = spilled_sgprs(p);
-                    (uniform, val_uniform) = compute_uniformity(p, x.st, x.res, &x.io.inputs);
+                    let single_emulated_wave =
+                        req_mode == Wave64Mode::Emulate && total_threads <= wave;
+                    (uniform, val_uniform) =
+                        compute_uniformity(p, x.st, x.res, &x.io.inputs, single_emulated_wave);
                     let has_non_uniform_firstlane = insts().any(|i| {
                         i.name() == "v_readfirstlane_b32"
                             && matches!(
@@ -1411,9 +1418,7 @@ impl<'a> Lower<'a> {
         let is_init = self.s.m.cmp(self.cur, pred::EQ, console_lane, k0);
         let at0 = self.begin_guarded(Some(is_init));
         let pw = self.scratch_ptr(self.cur, base, stride, vwave, 0);
-        let pv = self.scratch_ptr(self.cur, base, stride, vwave, 1);
         self.s.m.store(self.cur, pw, kmax);
-        self.s.m.store(self.cur, pv, k0);
         self.end_guarded(at0, &[]);
 
         self.lds_barrier(self.cur);
@@ -1428,6 +1433,9 @@ impl<'a> Lower<'a> {
         self.lds_barrier(self.cur);
         let pw = self.scratch_ptr(self.cur, base, stride, vwave, 0);
         let winner = self.s.m.load(self.cur, pw);
+        // An empty EXEC mask selects console lane zero.
+        let empty = self.s.m.cmp(self.cur, pred::EQ, winner, kmax);
+        let winner = self.s.m.select(self.cur, empty, k0, winner);
         let is_win = self.s.m.cmp(self.cur, pred::EQ, winner, console_lane);
         let at_win = self.begin_guarded(Some(is_win));
         let pv = self.scratch_ptr(self.cur, base, stride, vwave, 1);
@@ -5144,17 +5152,14 @@ impl<'a> Lower<'a> {
             }
             "v_readfirstlane_b32" => {
                 let a = s(self, 0)?;
-                let non_uniform = v.src.first().is_some_and(|op| match *op {
-                    Operand::Vector { reg, .. } => inst.read(Reg::V(reg)).is_some_and(|val| {
-                        !self
-                            .val_uniform
-                            .get(val.0 as usize)
-                            .copied()
-                            .unwrap_or(false)
-                    }),
-                    _ => false,
-                });
-                if self.emulating_wave() && (self.console_lanes || non_uniform) {
+                if self.emulating_wave() {
+                    if matches!(v.src.first(), Some(Operand::Vector { reg, .. })
+                        if inst.read(Reg::V(*reg)).is_some_and(|value| {
+                            self.val_uniform.get(value.0 as usize).copied().unwrap_or(false)
+                        }))
+                    {
+                        return int(self, a);
+                    }
                     self.cross_lane(false)?;
                     let r = self.emulated_readfirstlane(a, guard)?;
                     return int(self, r);

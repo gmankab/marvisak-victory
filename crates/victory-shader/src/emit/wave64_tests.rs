@@ -876,6 +876,43 @@ mod gpu {
     }
 
     #[test]
+    fn gpu_wave32_firstlane_result_can_control_a_group_branch() {
+        let mut code = Vec::new();
+        code.extend_from_slice(&v_mbcnt_lo_u32_b32(1, NEG_ONE, inline_u(0)));
+        code.push(v_readfirstlane_b32(4, 0));
+        code.push(s_cmp_lt_u32(inline_u(0), 4));
+        code.push(s_cbranch_scc1(3));
+        code.push(v_add_nc_u32(2, inline_u(7), 0));
+        code.push(v_readfirstlane_b32(5, 2));
+        code.push(v_add_nc_u32(1, 5, 1));
+        emit_uav_store(&mut code, 1, 0);
+        code.push(S_ENDPGM);
+
+        let mut prog = make_cs_program(&code, [32, 1, 1], 0, false);
+        prog.wave64 = false;
+        let expected: Vec<u32> = (7..39).collect();
+        run_on_hosts("wave32_firstlane_group_branch", &prog, [1, 1, 1], 32, &expected, false);
+    }
+
+    #[test]
+    fn gpu_wave32_firstlane_with_empty_exec_reads_lane_zero() {
+        let mut code = Vec::new();
+        code.extend_from_slice(&v_mbcnt_lo_u32_b32(1, NEG_ONE, inline_u(0)));
+        code.push(v_add_nc_u32(2, inline_u(11), 0));
+        code.push(s_mov_b32(EXEC_LO, inline_u(0)));
+        code.push(v_readfirstlane_b32(4, 2));
+        code.push(s_mov_b32(EXEC_LO, NEG_ONE));
+        code.push(v_add_nc_u32(1, 4, 1));
+        emit_uav_store(&mut code, 1, 0);
+        code.push(S_ENDPGM);
+
+        let mut prog = make_cs_program(&code, [32, 1, 1], 0, false);
+        prog.wave64 = false;
+        let expected: Vec<u32> = (11..43).collect();
+        run_on_hosts("wave32_firstlane_empty_exec", &prog, [1, 1, 1], 32, &expected, false);
+    }
+
+    #[test]
     fn gpu_wave32_ballot_and_lane_reads_stay_in_each_virtual_wave() {
         let mut code = Vec::new();
         code.push(v_cmp_lt_u32(inline_u(20), 0));
