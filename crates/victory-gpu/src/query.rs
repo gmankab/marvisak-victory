@@ -3,26 +3,24 @@
 //! read real counts; the other heap types are still answered at resolve
 //! time.
 
-use std::sync::Mutex;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
 use windows::Win32::Graphics::Direct3D12::{
     D3D12_QUERY_HEAP_DESC, D3D12_QUERY_HEAP_TYPE_OCCLUSION, D3D12_QUERY_TYPE,
-    D3D12_QUERY_TYPE_BINARY_OCCLUSION, D3D12_QUERY_TYPE_OCCLUSION, ID3D12QueryHeap,
+    D3D12_QUERY_TYPE_BINARY_OCCLUSION, D3D12_QUERY_TYPE_OCCLUSION, D3D12_RANGE,
+    ID3D12GraphicsCommandList, ID3D12QueryHeap, ID3D12Resource,
 };
 
+use crate::host::Host;
 use crate::object::{self, E_INVALIDARG, HRESULT, Iid, Object, QUERY_HEAP, Table, This, guid};
+use crate::queue::Written;
 use crate::resource::PAGEABLE_IIDS;
 
-/// `D3D12_QUERY_HEAP_TYPE_OCCLUSION`: the heap type the host measures. Its
-/// own kinds are not query types — a heap of type `TIMESTAMP` (1) takes no
-/// occlusion query, and an occlusion heap answers both the count and the
-/// pass/fail query types.
+pub(crate) const OCCLUSION: u32 = 0;
+pub(crate) const BINARY: u32 = 1;
 const HEAP_OCCLUSION: u32 = 0;
-
-/// Query types, as `BeginQuery`, `EndQuery` and `ResolveQueryData` name
-/// them: samples that passed, or (binary) whether any did.
-const QUERY_OCCLUSION: u32 = 0;
-const QUERY_BINARY: u32 = 1;
+const CHUNK_SIZE: usize = 256;
 
 const HEAP_IIDS: [Iid; 4] = [
     guid(
@@ -48,46 +46,12 @@ pub(crate) struct Desc {
 struct Heap {
     object: Object,
     desc: Desc,
-    /// The host's own heap for an occlusion heap, made with the same count
-    /// so every index the title marks exists.
-    host: Option<ID3D12QueryHeap>,
-    /// Which queries are open or ended but not yet resolved, one flag per
-    /// index: D3D12 refuses a resolve of a query that is open, and the
-    /// values of one never ended are undefined.
-    state: Mutex<Vec<State>>,
+    samples: Arc<Samples>,
 }
 
-/// A query's state, as the marks move it.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum State {
-    /// Never marked, or resolved already.
-    Idle,
-    Open,
-    Ended,
-}
-
-/// The host heap for a description: only an occlusion heap measures there.
-fn host_heap(desc: &Desc) -> Option<ID3D12QueryHeap> {
-    if desc.kind != HEAP_OCCLUSION || desc.count == 0 {
-        return None;
-    }
-    let host = crate::host::host()?;
-    let mut heap: Option<ID3D12QueryHeap> = None;
-    // SAFETY: plain object creation.
-    unsafe {
-        host.device
-            .CreateQueryHeap(
-                &D3D12_QUERY_HEAP_DESC {
-                    Type: D3D12_QUERY_HEAP_TYPE_OCCLUSION,
-                    Count: desc.count,
-                    NodeMask: 0,
-                },
-                &mut heap,
-            )
-            .ok()?;
-    }
-    heap
-}
+/// Last completed value at a title heap index, updated in submission order.
+#[derive(Default)]
+struct Samples(Mutex<HashMap<u32, (u32, u64)>>);
 
 /// Device method.
 pub(crate) extern "win64" fn create(
@@ -100,95 +64,285 @@ pub(crate) extern "win64" fn create(
     let Some(&desc) = (unsafe { desc.as_ref() }) else {
         return E_INVALIDARG;
     };
-    let host = host_heap(&desc);
-    tracing::debug!(?desc, measuring = host.is_some(), "query heap");
+    tracing::debug!(?desc, "query heap");
     let heap = Box::new(Heap {
         object: Object::new(&FUNCTIONS),
         desc,
-        host,
-        state: Mutex::new(vec![State::Idle; desc.count as usize]),
+        samples: Arc::default(),
     });
     object::hand_out(QUERY_HEAP, heap, iid, &HEAP_IIDS, out)
 }
 
-/// What a mark or a resolve of `query_kind` on this heap may ask the host:
-/// the host heap and the D3D12 query type, which comes from the title's own
-/// argument and not from the heap's type. `None` for a heap that does not
-/// measure on the host, a query type it cannot answer, or an index outside
-/// its count.
-pub(crate) fn host(
-    this: This,
-    query_kind: u32,
-    index: u32,
-) -> Option<(ID3D12QueryHeap, D3D12_QUERY_TYPE)> {
-    if this.is_null() {
-        return None;
-    }
-    // SAFETY: the title passes a heap it created here.
-    let heap = unsafe { &*this.cast::<Heap>() };
-    let query = match query_kind {
-        QUERY_OCCLUSION => D3D12_QUERY_TYPE_OCCLUSION,
-        QUERY_BINARY => D3D12_QUERY_TYPE_BINARY_OCCLUSION,
-        _ => return None,
-    };
-    if index >= heap.desc.count {
-        return None;
-    }
-    Some((heap.host.clone()?, query))
+fn samples(this: This, first: u32, count: u32) -> Option<Arc<Samples>> {
+    // SAFETY: the title passes a heap it created here, or null.
+    let heap = unsafe { this.cast::<Heap>().as_ref() }?;
+    (heap.desc.kind == HEAP_OCCLUSION && first.checked_add(count)? <= heap.desc.count)
+        .then(|| heap.samples.clone())
 }
 
-/// How many queries the heap holds; `None` if it is not one of ours.
-pub(crate) fn count(this: This) -> Option<u32> {
-    if this.is_null() {
-        return None;
+fn host_type(kind: u32) -> D3D12_QUERY_TYPE {
+    if kind == BINARY {
+        D3D12_QUERY_TYPE_BINARY_OCCLUSION
+    } else {
+        D3D12_QUERY_TYPE_OCCLUSION
     }
-    // SAFETY: the title passes a heap it created here.
-    Some(unsafe { &*this.cast::<Heap>() }.desc.count)
 }
 
-/// Tracks a mark: `begin` opens a query, and `end` closes it. Returns
-/// whether the mark is one D3D12 allows, so the caller records nothing
-/// else.
-pub(crate) fn mark(this: This, index: u32, begin: bool) -> Option<()> {
-    if this.is_null() {
-        return None;
-    }
-    // SAFETY: the title passes a heap it created here.
-    let heap = unsafe { &*this.cast::<Heap>() };
-    let mut state = heap.state.lock().unwrap_or_else(|e| e.into_inner());
-    let at = state.get_mut(index as usize)?;
-    match (begin, *at) {
-        (true, State::Idle) => *at = State::Open,
-        (false, State::Open) => *at = State::Ended,
-        // An end without a begin, or a begin on an open one: the title's
-        // own mistake, and the marks would not be what it thinks.
-        _ => return None,
-    }
-    Some(())
+/// A host query slot for one Begin/End, distinct from other pairs of the same
+/// title index in this recording. Slots of a kind are resolved in batches.
+#[derive(Clone, Copy)]
+struct Slot {
+    kind: u32,
+    number: usize,
+    missed: u64,
 }
 
-/// Whether queries `first .. first + count` are all ended, so they may be
-/// resolved: D3D12 refuses to resolve one that is open, and one that was
-/// never marked has no value.
-pub(crate) fn resolved(this: This, first: u32, count: u32) -> Option<()> {
-    if this.is_null() {
-        return None;
-    }
-    // SAFETY: the title passes a heap it created here.
-    let heap = unsafe { &*this.cast::<Heap>() };
-    let mut state = heap.state.lock().unwrap_or_else(|e| e.into_inner());
-    let end = first.checked_add(count)?;
-    if end > heap.desc.count {
-        return None;
-    }
-    for index in first..end {
-        let at = state.get_mut(index as usize)?;
-        if *at != State::Ended {
-            return None;
+struct Chunk {
+    heap: ID3D12QueryHeap,
+    readback: ID3D12Resource,
+    values: [u64; CHUNK_SIZE],
+    available: bool,
+}
+
+impl Chunk {
+    fn new(host: &Host) -> Option<Self> {
+        let mut heap = None;
+        // SAFETY: plain object creation.
+        unsafe {
+            host.device
+                .CreateQueryHeap(
+                    &D3D12_QUERY_HEAP_DESC {
+                        Type: D3D12_QUERY_HEAP_TYPE_OCCLUSION,
+                        Count: CHUNK_SIZE as u32,
+                        NodeMask: 0,
+                    },
+                    &mut heap,
+                )
+                .ok()?;
         }
-        *at = State::Idle;
+        Some(Self {
+            heap: heap?,
+            readback: host.readback_buffer((CHUNK_SIZE * 8) as u64)?,
+            values: [0; CHUNK_SIZE],
+            available: false,
+        })
     }
-    Some(())
+
+    fn read(&mut self, count: usize) {
+        let mut data = std::ptr::null_mut();
+        let range = D3D12_RANGE {
+            Begin: 0,
+            End: count * 8,
+        };
+        // SAFETY: this chunk's resolve completed and the read range fits.
+        let mapped = unsafe { self.readback.Map(0, Some(&range), Some(&mut data)) };
+        self.available = mapped.is_ok() && !data.is_null();
+        if self.available {
+            // SAFETY: Map supplied the pointer to the checked range.
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    data.cast::<u8>(),
+                    self.values.as_mut_ptr().cast(),
+                    count * 8,
+                );
+            }
+        }
+        if mapped.is_ok() {
+            // SAFETY: a successful map has exactly one unmap.
+            unsafe { self.readback.Unmap(0, None) };
+        }
+    }
+}
+
+enum Event {
+    Begin(Arc<Samples>, u32),
+    End(Arc<Samples>, u32, Slot),
+    Resolve(Option<Arc<Samples>>, u32, u32, u32, usize),
+}
+
+/// Real GPU queries always begin, end and resolve inside the recording that
+/// measured them. The title's resolves observe those samples in execution
+/// order, including when it records the resolve on a different thread/list.
+#[derive(Default)]
+pub(crate) struct Recording {
+    open: HashMap<(usize, u32), Slot>,
+    events: Vec<Event>,
+    chunks: [Vec<Chunk>; 2],
+    used: [usize; 2],
+    missed: u64,
+}
+
+impl Recording {
+    pub(crate) fn mark(
+        &mut self,
+        list: &ID3D12GraphicsCommandList,
+        heap: This,
+        kind: u32,
+        index: u32,
+        begin: bool,
+    ) {
+        if !matches!(kind, OCCLUSION | BINARY) {
+            return;
+        }
+        let Some(samples) = samples(heap, index, 1) else {
+            return;
+        };
+        let key = (Arc::as_ptr(&samples) as usize, index);
+        if begin {
+            if self.open.contains_key(&key) {
+                return;
+            }
+            self.events.push(Event::Begin(samples, index));
+            let used = &mut self.used[kind as usize];
+            let chunks = &mut self.chunks[kind as usize];
+            let chunk = *used / CHUNK_SIZE;
+            if chunk == chunks.len() {
+                let Some(new) = crate::host::host().and_then(Chunk::new) else {
+                    return;
+                };
+                chunks.push(new);
+            }
+            let slot = Slot {
+                kind,
+                number: *used,
+                missed: self.missed,
+            };
+            let chunk = &chunks[chunk];
+            // SAFETY: this open list owns this unused host slot.
+            unsafe { list.BeginQuery(&chunk.heap, host_type(kind), (*used % CHUNK_SIZE) as u32) };
+            *used += 1;
+            self.open.insert(key, slot);
+        } else if self.open.get(&key).is_some_and(|slot| slot.kind == kind) {
+            let slot = self.open.remove(&key).unwrap();
+            Self::end(list, &self.chunks, slot);
+            if self.missed == slot.missed {
+                self.events.push(Event::End(samples, index, slot));
+            }
+        }
+    }
+
+    fn end(list: &ID3D12GraphicsCommandList, chunks: &[Vec<Chunk>; 2], slot: Slot) {
+        let chunk = &chunks[slot.kind as usize][slot.number / CHUNK_SIZE];
+        // SAFETY: the host begin for this slot was recorded on this list.
+        unsafe {
+            list.EndQuery(
+                &chunk.heap,
+                host_type(slot.kind),
+                (slot.number % CHUNK_SIZE) as u32,
+            )
+        };
+    }
+
+    pub(crate) fn missed_draw(&mut self) {
+        self.missed += 1;
+    }
+
+    pub(crate) fn resolve(&mut self, heap: This, kind: u32, first: u32, count: u32, dst: *mut u8) {
+        self.events.push(Event::Resolve(
+            samples(heap, first, count),
+            kind,
+            first,
+            count,
+            dst as usize,
+        ));
+    }
+
+    pub(crate) fn close(&mut self, list: &ID3D12GraphicsCommandList) {
+        // Complete any abandoned host query so its slot is safe to resolve.
+        // No End event means the title sees the visible fallback for it.
+        for (_, slot) in self.open.drain() {
+            Self::end(list, &self.chunks, slot);
+        }
+        for (kind, chunks) in self.chunks.iter().enumerate() {
+            let mut remaining = self.used[kind];
+            for chunk in chunks.iter().take(remaining.div_ceil(CHUNK_SIZE)) {
+                let count = remaining.min(CHUNK_SIZE);
+                // SAFETY: all slots in this range ended on this list, and
+                // the readback buffer holds the entire range.
+                unsafe {
+                    list.ResolveQueryData(
+                        &chunk.heap,
+                        host_type(kind as u32),
+                        0,
+                        count as u32,
+                        &chunk.readback,
+                        0,
+                    );
+                }
+                remaining -= count;
+            }
+        }
+    }
+
+    pub(crate) fn reset(&mut self) -> Self {
+        Self {
+            chunks: std::mem::take(&mut self.chunks),
+            ..Self::default()
+        }
+    }
+
+    pub(crate) fn complete(&mut self, waited: bool) {
+        if waited {
+            for (kind, chunks) in self.chunks.iter_mut().enumerate() {
+                let mut remaining = self.used[kind];
+                for chunk in chunks.iter_mut().take(remaining.div_ceil(CHUNK_SIZE)) {
+                    let count = remaining.min(CHUNK_SIZE);
+                    chunk.read(count);
+                    remaining -= count;
+                }
+            }
+        }
+
+        let mut measured = 0u64;
+        let mut fallback = 0u64;
+        for event in &self.events {
+            match event {
+                Event::Begin(samples, index) => {
+                    samples
+                        .0
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .remove(index);
+                }
+                Event::End(samples, index, slot) => {
+                    let chunk = &self.chunks[slot.kind as usize][slot.number / CHUNK_SIZE];
+                    if waited && chunk.available {
+                        let value = chunk.values[slot.number % CHUNK_SIZE];
+                        samples
+                            .0
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .insert(*index, (slot.kind, value));
+                    }
+                }
+                Event::Resolve(samples, kind, first, count, dst) => {
+                    let values = samples
+                        .as_ref()
+                        .map(|s| s.0.lock().unwrap_or_else(|e| e.into_inner()));
+                    for i in 0..*count {
+                        let value = values
+                            .as_ref()
+                            .and_then(|values| values.get(&(first + i)))
+                            .filter(|(query_kind, _)| query_kind == kind);
+                        let value = match value {
+                            Some((_, value)) => {
+                                measured += 1;
+                                *value
+                            }
+                            None => {
+                                fallback += 1;
+                                if *kind == BINARY { 1 } else { 1 << 20 }
+                            }
+                        };
+                        Written::Value(value).write((dst + i as usize * 8) as *mut u8, 8);
+                    }
+                }
+            }
+        }
+        if measured + fallback != 0 {
+            tracing::debug!(measured, fallback, "occlusion query results");
+        }
+    }
 }
 
 extern "win64" fn query(this: This, iid: *const Iid, out: *mut This) -> HRESULT {
@@ -204,7 +358,7 @@ extern "win64" fn release(this: This) -> u32 {
 }
 
 /// An occlusion heap made the way the device makes one, for the tests:
-/// `None` when the host refuses it (no GPU, or no heap of that kind).
+/// `None` when creation fails.
 #[cfg(test)]
 pub(crate) fn occlusion_for_test(kind: u32, count: u32) -> Option<This> {
     let desc = Desc {

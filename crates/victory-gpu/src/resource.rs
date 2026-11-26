@@ -1879,22 +1879,18 @@ mod tests {
         assert_eq!(slot::<Release>(heap, 0x10)(heap), 1);
         assert_eq!(slot::<Release>(placed, 0x10)(placed), 0);
     }
-    /// An occlusion query around no draws reports zero samples, not the
-    /// million the stub used to: the heap measures on the host, the list
-    /// marks it, `ResolveQueryData` brings the count back, and the title's
-    /// buffer holds the number once the submission finished.
-    #[cfg(windows)]
+    /// Records the resolve list before its producer and asks for two copies
+    /// of the same result, then submits it again after a later measurement
+    /// and after a draw the host dropped.
     #[test]
-    fn an_occlusion_query_reports_what_the_draws_passed() {
-        let Some(_host) = crate::host::host() else {
-            return; // no host GPU here
+    fn occlusion_queries_follow_submission_order() {
+        let Some(_) = crate::host::host() else {
+            eprintln!("no host D3D12 device; skipped");
+            return;
         };
+        use crate::query::{BINARY, OCCLUSION};
         let null = std::ptr::null();
-        const OCCLUSION: u32 = 0;
-        const COUNT: u32 = 4;
-        let Some(heap) = crate::query::occlusion_for_test(OCCLUSION, COUNT) else {
-            return; // the host refused an occlusion heap
-        };
+        let heap = crate::query::occlusion_for_test(0, 4).unwrap();
         let mut results = null;
         assert_eq!(
             create_committed(
@@ -1927,7 +1923,7 @@ mod tests {
             0x4185,
             [0x8b, 0xa8, 0xb3, 0xae, 0x42, 0xa5, 0xa4, 0x55],
         );
-        let (mut queue, mut allocator, mut list) = (null, null, null);
+        let (mut queue, mut allocator) = (null, null);
         let queue_desc = [0u32; 4];
         assert_eq!(
             crate::queue::create(null, queue_desc.as_ptr().cast(), &queue_iid, &mut queue),
@@ -1937,61 +1933,88 @@ mod tests {
             crate::list::create_allocator(null, 0, &allocator_iid, &mut allocator),
             S_OK
         );
-        assert_eq!(
-            crate::list::create_list(null, 0, 0, allocator, null, &list_iid, &mut list),
-            S_OK
-        );
-        // Four queries marked around nothing: every count is zero.
-        for index in 0..COUNT {
-            crate::list::query_begin(list, heap, OCCLUSION, index);
-            crate::list::query_end(list, heap, OCCLUSION, index);
-        }
-        crate::list::resolve_queries(list, heap, OCCLUSION, 0, COUNT, results, 0);
-        assert_eq!(
-            slot::<extern "system" fn(This) -> HRESULT>(list, 0x48)(list),
-            S_OK
-        );
-        slot::<extern "system" fn(This, u32, *const This)>(queue, 0x50)(queue, 1, &list);
-
+        let new_list = || {
+            let mut list = null;
+            assert_eq!(
+                crate::list::create_list(null, 0, 0, allocator, null, &list_iid, &mut list),
+                S_OK
+            );
+            list
+        };
+        let close = |list: This| {
+            assert_eq!(slot::<extern "win64" fn(This) -> HRESULT>(list, 0x48)(list), S_OK);
+        };
+        let submit = |lists: &[This]| {
+            slot::<extern "win64" fn(This, u32, *const This)>(queue, 0x50)(
+                queue,
+                lists.len() as u32,
+                lists.as_ptr(),
+            );
+        };
         let (data, size) = buffer_bytes(results).unwrap();
         assert_eq!(size, 64);
-        // SAFETY: the submission was waited for; 64 bytes of title memory.
-        let counts = unsafe { std::slice::from_raw_parts(data.cast::<u64>(), 8) };
-        assert_eq!(
-            &counts[..COUNT as usize],
-            &[0u64; COUNT as usize],
-            "nothing was drawn, so nothing passed"
-        );
-        assert!(
-            counts[COUNT as usize..].iter().all(|&c| c == 0),
-            "the rest of the buffer stays untouched"
-        );
+        let read = |index: usize| {
+            // SAFETY: the queue waits for each submission and the test owns this buffer.
+            unsafe { data.cast::<u64>().add(index).read_unaligned() }
+        };
+        // SAFETY: all 64 bytes of the destination belong to this test.
+        unsafe { data.write_bytes(0xa5, 64) };
 
-        // The heap type is not a query type: a timestamp heap measures
-        // nothing on the host, and an occlusion query on it is refused.
-        if let Some(stamps) = crate::query::occlusion_for_test(1 /* TIMESTAMP heap */, COUNT) {
-            assert!(
-                crate::query::host(stamps, OCCLUSION, 0).is_none(),
-                "a timestamp heap takes no occlusion query"
-            );
+        let resolve = new_list();
+        crate::list::resolve_queries(resolve, heap, OCCLUSION, 0, 4, results, 8);
+        crate::list::resolve_queries(resolve, heap, BINARY, 2, 1, results, 40);
+        crate::list::resolve_queries(resolve, heap, OCCLUSION, 0, 1, results, 48);
+        crate::list::resolve_queries(resolve, heap, OCCLUSION, 0, 1, results, u64::MAX);
+        close(resolve);
+
+        let producer = new_list();
+        for _ in 0..2 {
+            crate::list::query_begin(producer, heap, OCCLUSION, 0);
+            crate::list::query_end(producer, heap, OCCLUSION, 0);
         }
-        // A query that was never ended is not resolved, and neither is one
-        // outside the heap: D3D12 refuses both, and the readback of a query
-        // never run has no value to write into title memory.
-        assert!(
-            crate::query::resolved(heap, 0, 1).is_none(),
-            "a query never marked has no value"
-        );
-        assert!(
-            crate::query::host(heap, OCCLUSION, COUNT).is_none(),
-            "an index at the count is outside the heap"
-        );
+        crate::list::query_begin(producer, heap, OCCLUSION, 1);
+        crate::list::query_end(producer, heap, BINARY, 1); // mismatched end
+        crate::list::query_begin(producer, heap, BINARY, 2);
+        crate::list::query_end(producer, heap, BINARY, 2);
+        close(producer);
 
-        let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
-        assert_eq!(release(list), 0);
-        assert_eq!(release(allocator), 0);
-        assert_eq!(release(queue), 0);
+        let later = new_list();
+        // Use enough samples to span more than one host readback chunk.
+        for _ in 0..257 {
+            crate::list::query_begin(later, heap, OCCLUSION, 3);
+            crate::list::query_end(later, heap, OCCLUSION, 3);
+        }
+        close(later);
+
+        let missed = new_list();
+        crate::list::query_begin(missed, heap, OCCLUSION, 0);
+        let draw = slot::<extern "win64" fn(This, u32, u32, u32, u32)>(missed, 0x60);
+        draw(missed, 3, 1, 0, 0); // no graphics pipeline is bound
+        crate::list::query_end(missed, heap, OCCLUSION, 0);
+        close(missed);
+
+        // Releasing the title heap leaves the recorded queries and resolves valid.
+        let release = |obj: This| slot::<Release>(obj, 0x10)(obj);
         assert_eq!(release(heap), 0);
-        assert_eq!(release(results), 0);
+
+        const VISIBLE: u64 = 1 << 20;
+        submit(&[producer, resolve]);
+        assert_eq!(
+            (1..7).map(read).collect::<Vec<_>>(),
+            [0, VISIBLE, VISIBLE, VISIBLE, 0, 0]
+        );
+        assert_eq!(read(0), 0xa5a5_a5a5_a5a5_a5a5);
+        assert_eq!(read(7), 0xa5a5_a5a5_a5a5_a5a5);
+
+        submit(&[later]);
+        submit(&[resolve]);
+        assert_eq!(read(4), 0);
+
+        submit(&[missed, resolve]);
+        assert_eq!(read(1), VISIBLE);
+        assert_eq!(read(6), VISIBLE);
+        for obj in [resolve, producer, later, missed, allocator, queue, results] {
+            assert_eq!(release(obj), 0);
+        }
     }
 }

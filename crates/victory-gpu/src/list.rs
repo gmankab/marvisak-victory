@@ -816,30 +816,9 @@ pub(crate) extern "win64" fn query_end(this: This, heap: This, kind: u32, index:
 }
 
 fn mark(this: This, heap: This, kind: u32, index: u32, begin: bool) {
-    const OCCLUSION: u32 = 0;
-    const BINARY: u32 = 1;
-    if matches!(kind, OCCLUSION | BINARY)
-        && let Some(list) = host_list(this)
-        // The query type is the title's argument; the heap only says whether
-        // it measures on the host (`crate::query::host`).
-        && let Some((host, query)) = crate::query::host(heap, kind, index)
-    {
-        // A mark the host would refuse (an end without a begin) is not
-        // recorded, so the resolve does not read a query it never ended.
-        if crate::query::mark(heap, index, begin).is_none() {
-            return;
-        }
-        // SAFETY: an open list and the heap the query belongs to.
-        unsafe {
-            if begin {
-                list.list.BeginQuery(&host, query, index);
-            } else {
-                list.list.EndQuery(&host, query, index);
-            }
-        }
-        return;
+    if let Some(list) = host_list(this) {
+        list.mark_query(heap, kind, index, begin);
     }
-    let _ = (this, heap, kind, index, begin);
 }
 
 /// `ResolveQueryData(heap, type, first, count, buffer, offset)`: writes
@@ -859,41 +838,12 @@ pub(crate) extern "win64" fn resolve_queries(
     buffer: This,
     offset: u64,
 ) {
-    const OCCLUSION: u32 = 0;
-    const BINARY: u32 = 1;
+    use crate::query::{BINARY, OCCLUSION};
     const TIMESTAMP: u32 = 2;
     const PIPELINE_STATISTICS: u32 = 3;
     let Some((data, size)) = crate::resource::buffer_bytes(buffer) else {
         return;
     };
-    // Occlusion results are one 64-bit count each.
-    let measured = matches!(kind, OCCLUSION | BINARY)
-        && offset
-            .checked_add(u64::from(count) * 8)
-            .is_some_and(|end| end <= size);
-    if measured
-        && let Some(list) = host_list(this)
-        // Every index has to be inside the heap and ended: D3D12 refuses to
-        // resolve an open query, and one never marked has no value to read.
-        && let Some((host, query)) = crate::query::host(heap, kind, first)
-        && crate::query::count(heap).is_some_and(|n| first.saturating_add(count) <= n)
-        && crate::query::resolved(heap, first, count).is_some()
-        && let Some(readback) =
-            crate::host::host().and_then(|h| h.readback_buffer(u64::from(count.max(1)) * 8))
-    {
-        // SAFETY: an open list, our heap and a buffer made for exactly
-        // these results, in the state a resolve needs.
-        unsafe {
-            list.list
-                .ResolveQueryData(&host, query, first, count, &readback, 0);
-        }
-        let targets = (0..u64::from(count))
-            .map(|i| (data as usize + (offset + i * 8) as usize, i * 8, 8usize))
-            .collect();
-        list.defer_resolve(readback, targets);
-        return;
-    }
-    let _ = (this, heap, measured);
     let (what, bytes) = match kind {
         OCCLUSION => (Written::Value(1 << 20), 8),
         BINARY => (Written::Value(1), 8),
@@ -901,7 +851,19 @@ pub(crate) extern "win64" fn resolve_queries(
         PIPELINE_STATISTICS => (Written::Value(0), 88),
         _ => (Written::Value(0), 16),
     };
-    if offset + u64::from(count) * bytes > size {
+    if count == 0
+        || offset
+            .checked_add(u64::from(count) * bytes)
+            .is_none_or(|end| end > size)
+    {
+        return;
+    }
+    if matches!(kind, OCCLUSION | BINARY)
+        && let Some(list) = host_list(this)
+    {
+        // SAFETY: the complete destination range is within the buffer.
+        let dst = unsafe { data.add(offset as usize) };
+        list.resolve_queries(heap, kind, first, count, dst);
         return;
     }
     for i in 0..u64::from(count) {
@@ -1140,6 +1102,9 @@ mod state {
         if indirect != 0 {
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| tracing::warn!("indirect mesh dispatches dropped"));
+            if let Some(list) = host_list(this) {
+                list.missed_draw();
+            }
             return;
         }
         with_state(this, |list, s| s.dispatch_mesh(list, x));
@@ -1213,6 +1178,9 @@ extern "win64" fn execute_indirect(
     }
     if ran {
         return;
+    }
+    if let Some(list) = host_list(this) {
+        list.missed_draw();
     }
     INDIRECT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     static SEEN: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
