@@ -1,4 +1,4 @@
-//! Tests for Wave64-on-Wave32 and portable LDS Wave64 compute lowering,
+//! Tests for Wave64-on-Wave32 and portable compute wave lowering,
 //! using synthetic GFX10 machine code on hardware GPU and WARP.
 
 use super::{HostShader, TranslateOptions, Wave64Mode, emit_with, translate_with};
@@ -238,6 +238,20 @@ fn sfi0_flags(shader: &HostShader) -> u64 {
         Some(p) => u64::from_le_bytes(p.data[0..8].try_into().unwrap()),
         None => 0,
     }
+}
+
+#[test]
+fn wave32_without_a_fixed_width_keeps_native_lowering() {
+    let mut code = vec![v_readfirstlane_b32(4, 0), v_mov_b32(1, 4)];
+    emit_uav_store(&mut code, 1, 0);
+    code.push(S_ENDPGM);
+    let mut prog = make_cs_program(&code, [32, 1, 1], 0, false);
+    prog.wave64 = false;
+
+    let native = emit_cs(&prog, Wave64Mode::Native).unwrap();
+    let emulated = emit_cs(&prog, Wave64Mode::Emulate).unwrap();
+    assert_eq!(psv_wave_range(&native), (0, u32::MAX));
+    assert_eq!(emulated.dxil, native.dxil);
 }
 
 #[test]
@@ -859,6 +873,40 @@ mod gpu {
                 false,
             );
         }
+    }
+
+    #[test]
+    fn gpu_wave32_ballot_and_lane_reads_stay_in_each_virtual_wave() {
+        let mut code = Vec::new();
+        code.push(v_cmp_lt_u32(inline_u(20), 0));
+        code.push(sop1(4, 0x0F, VCC)); // s_bcnt1_i32_b32
+        code.push(v_readfirstlane_b32(5, 0));
+        code.extend_from_slice(&v_readlane_b32(6, 0, inline_u(40)));
+        code.push(v_mov_b32(2, inline_u(0)));
+        code.extend_from_slice(&v_writelane_b32(2, 6, inline_u(40)));
+        code.extend_from_slice(&v_readlane_b32(7, 2, inline_u(8)));
+        code.push(v_add_nc_u32(2, 4, 2));
+        code.push(v_add_nc_u32(2, 5, 2));
+        code.push(v_add_nc_u32(2, 7, 2));
+        emit_uav_store(&mut code, 2, 0);
+        code.push(S_ENDPGM);
+
+        let mut prog = make_cs_program(&code, [48, 1, 1], 0, false);
+        prog.wave64 = false;
+        let native = emit_cs(&prog, Wave64Mode::Native).unwrap();
+        let emulated = emit_cs(&prog, Wave64Mode::Emulate).unwrap();
+        assert_eq!(psv_wave_range(&native), (32, 32));
+        assert_eq!(psv_wave_range(&emulated), (0, u32::MAX));
+        assert_eq!(sfi0_flags(&emulated) & 0x4000, 0);
+        let expected: Vec<u32> = (0..48)
+            .map(|id| {
+                let base = id & !31;
+                let count = if base == 0 { 11 } else { 16 };
+                let picked = base + 8;
+                count + base + picked + if id & 31 == 8 { picked } else { 0 }
+            })
+            .collect();
+        run_on_hosts("wave32_partial_ballot_and_reads", &prog, [1, 1, 1], 48, &expected, false);
     }
 
     #[test]

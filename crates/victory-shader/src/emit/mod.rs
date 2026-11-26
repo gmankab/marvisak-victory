@@ -192,15 +192,15 @@ pub struct UserData {
     pub dword: u32,
 }
 
-/// How a Wave64 compute shader is mapped onto the host device.
+/// How compute waves are mapped onto the host device.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Wave64Mode {
-    /// Emit native `WaveSize(64)` when compute lane semantics require it.
+    /// Keep the console wave size when compute lane semantics require it.
     #[default]
     Native,
     /// Map virtual 64-lane waves onto 32-lane host waves (`WaveSize(32)`).
     Wave32,
-    /// Emulate 64-lane waves in group-shared memory without `WaveSize`.
+    /// Emulate console waves in group-shared memory without `WaveSize`.
     Emulate,
 }
 

@@ -828,7 +828,7 @@ fn restored_with(
         defs,
         phis,
         inst.read(Reg::V(reg))?,
-        lane_of(lane)?,
+        lane_of(p, lane)?,
         &mut Vec::new(),
     )
     .ok()
@@ -870,7 +870,7 @@ fn spilled_with(
     if inst.name() != "v_writelane_b32" {
         return Err(());
     }
-    if lane_of(*at).ok_or(())? != lane {
+    if lane_of(p, *at).ok_or(())? != lane {
         return spilled_with(p, defs, phis, inst.read(Reg::V(reg)).ok_or(())?, lane, seen);
     }
     match *value {
@@ -891,13 +891,14 @@ impl Tracer<'_> {
     }
 }
 
-/// A lane select given as a constant.
-fn lane_of(op: Operand) -> Option<u32> {
-    match op {
+/// A constant lane select, wrapped to the console wave width.
+fn lane_of(p: &Program, op: Operand) -> Option<u32> {
+    let lane = match op {
         Operand::Const(c) => inline(c),
         Operand::Literal(x) => Some(x),
         _ => None,
-    }
+    }?;
+    Some(lane & if p.wave64 { 63 } else { 31 })
 }
 
 /// What dword `k` of a move's result copies.

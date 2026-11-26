@@ -174,23 +174,23 @@ struct Lower<'a> {
     /// Compute code that reads other lanes: thread ids follow the host
     /// lanes, so lane n is console lane n.
     console_lanes: bool,
-    /// Wave64 compute lowering mode (`Native` when not a Wave64 compute shader).
+    /// Compute wave lowering mode.
     wave64: Wave64Mode,
     /// Compute thread count per group (0 outside compute).
     total_threads: u32,
     /// LDS dwords declared by the title itself (excluding emulation scratch).
     title_lds_dwords: u32,
-    /// Virtual 64-lane waves per thread group (`total_threads.div_ceil(64)`).
+    /// Virtual console waves per thread group.
     virtual_waves: u32,
     /// Base dword index of the ballot / firstlane LDS scratch region.
     ballot_base: u32,
     /// Scratch dwords per virtual wave in `ballot_base` (`2` or `4`).
     ballot_stride: u32,
-    /// Base dword index of the per-lane LDS exchange region (`64 * virtual_waves`).
+    /// Base dword index of the per-lane LDS exchange region.
     exchange_base: u32,
     /// Emulation scratch pushed total LDS past D3D12's 32 KiB (8192 dword) limit.
     lds_overflow: bool,
-    /// Barrier-less `<= 64`-thread Wave64 compute shader sharing LDS across host waves.
+    /// Insert barriers where emulated lanes rely on wave lockstep for LDS.
     need_lds_barriers: bool,
     /// Pre-resolved constant-lane `v_readlane_b32` SGPR spills by site.
     spills: HashMap<(usize, usize), Moved>,
@@ -198,7 +198,7 @@ struct Lower<'a> {
     uniform: Vec<bool>,
     /// Per IR value: conservatively true only for group-uniform scalars.
     val_uniform: Vec<bool>,
-    /// Entry-block `(flat_tid, console_lane, vwave)` cached when emulating Wave64.
+    /// Entry-block `(flat_tid, console_lane, vwave)` for emulated compute waves.
     wave_ids: Option<(V, V, V)>,
     /// Active `begin_guarded` nesting depth (never emit barriers while > 0).
     guard_depth: u32,
@@ -774,13 +774,21 @@ impl<'a> Lower<'a> {
                 })
             };
 
-            let req_mode = if x.native.wave64 {
+            let wave = if x.native.wave64 { 64 } else { 32 };
+            let needs_fixed_wave = console_lanes || total_threads <= wave && title_lds_dwords > 0;
+            let req_mode = if x.native.wave64
+                || needs_fixed_wave && x.options.wave64 == Wave64Mode::Emulate
+            {
                 x.options.wave64
             } else {
                 Wave64Mode::Native
             };
-            let has_lds_mem = insts()
-                .any(|i| matches!(i.fields, Fields::Ds { .. }) && i.name() != "ds_swizzle_b32");
+            let uses_lds = |i: &Inst| {
+                matches!(i.fields, Fields::Ds { gds: false, .. })
+                    && !i.name().starts_with("ds_swizzle")
+                    && !i.name().contains("permute")
+            };
+            let has_lds_mem = insts().any(uses_lds);
             let has_s_barrier = insts().any(|i| i.name() == "s_barrier");
             let has_swizzle_or_dpp = insts().any(|i| {
                 i.name().starts_with("ds_swizzle")
@@ -790,29 +798,7 @@ impl<'a> Lower<'a> {
 
             match req_mode {
                 Wave64Mode::Native => {
-                    let wave = if x.native.wave64 { 64 } else { 32 };
-                    let single_wave_lds = total_threads <= wave && title_lds_dwords > 0;
-                    let barrier_candidate = wave == 32
-                        && x.options.wave64 == Wave64Mode::Emulate
-                        && single_wave_lds
-                        && !console_lanes
-                        && !has_s_barrier
-                        && sections.is_empty()
-                        && !insts().any(|i| i.name() == "v_readfirstlane_b32");
-                    if barrier_candidate {
-                        (uniform, val_uniform) = compute_uniformity(p, x.st, x.res, &x.io.inputs);
-                        let safe_barriers = p.blocks.iter().enumerate().all(|(b, block)| {
-                            block.insts.iter().enumerate().all(|(i, inst)| {
-                                !matches!(inst.fields, Fields::Ds { .. })
-                                    || uniform[b] && x.st.guards[b][i].is_none()
-                            })
-                        });
-                        if safe_barriers {
-                            need_lds_barriers = total_threads > 1 && has_lds_mem;
-                        } else {
-                            s.wave_size = Some(wave);
-                        }
-                    } else if console_lanes || single_wave_lds {
+                    if needs_fixed_wave {
                         s.wave_size = Some(wave);
                     }
                 }
@@ -867,30 +853,40 @@ impl<'a> Lower<'a> {
                             }
                         }
                     } else {
-                        // Wave64Mode::Emulate (`s.wave_size = None`).
-                        if need_emu {
-                            wave64 = Wave64Mode::Emulate;
-                            virtual_waves = total_threads.div_ceil(64);
-                            ballot_stride = 2;
-                            let ballot_dwords = 2 * virtual_waves;
-                            let exchange_dwords = if !sections.is_empty()
-                                || has_unresolved_readlane
-                                || has_swizzle_or_dpp
-                            {
-                                64 * virtual_waves
-                            } else {
-                                0
-                            };
-                            ballot_base = title_lds_dwords;
-                            exchange_base = title_lds_dwords + ballot_dwords;
-                            let emu_dwords = ballot_dwords + exchange_dwords;
-                            s.lds_dwords = title_lds_dwords.saturating_add(emu_dwords);
-                            lds_overflow = emu_dwords > 0 && s.lds_dwords > 8192;
-                            cross_block_masks = collect_cross_block_masks(p, x.st, &def_block);
-                        }
-                        if total_threads > 1 && total_threads <= 64 && has_lds_mem && !has_s_barrier
-                        {
-                            need_lds_barriers = true;
+                        let wave32_lds_sync = wave == 32 && total_threads > 1 && has_lds_mem;
+                        let can_fence_all_lds = p.blocks.iter().enumerate().all(|(b, block)| {
+                            uniform[b] || !block.insts.iter().any(uses_lds)
+                        });
+                        if wave32_lds_sync && !can_fence_all_lds {
+                            // Group barriers cannot run on a path that only some lanes take.
+                            // Retain the native requirement when LDS lockstep cannot be proven.
+                            s.wave_size = Some(wave);
+                        } else {
+                            if need_emu {
+                                wave64 = Wave64Mode::Emulate;
+                                virtual_waves = total_threads.div_ceil(wave);
+                                ballot_stride = 2;
+                                let ballot_dwords = ballot_stride * virtual_waves;
+                                let exchange_dwords = if !sections.is_empty()
+                                    || has_unresolved_readlane
+                                    || has_swizzle_or_dpp
+                                {
+                                    wave * virtual_waves
+                                } else {
+                                    0
+                                };
+                                ballot_base = title_lds_dwords;
+                                exchange_base = title_lds_dwords + ballot_dwords;
+                                let emu_dwords = ballot_dwords + exchange_dwords;
+                                s.lds_dwords = title_lds_dwords.saturating_add(emu_dwords);
+                                lds_overflow = emu_dwords > 0 && s.lds_dwords > 8192;
+                                cross_block_masks = collect_cross_block_masks(p, x.st, &def_block);
+                            }
+                            need_lds_barriers = wave32_lds_sync
+                                || (1 < total_threads
+                                    && total_threads <= wave
+                                    && has_lds_mem
+                                    && !has_s_barrier);
                         }
                     }
                 }
@@ -1156,8 +1152,8 @@ impl<'a> Lower<'a> {
         Ok(())
     }
 
-    /// Whether this shader emulates 64-lane waves across multiple host waves or arbitrary width.
-    fn emulating_wave64(&self) -> bool {
+    /// Whether this shader emulates console waves across host subgroups.
+    fn emulating_wave(&self) -> bool {
         self.wave64 == Wave64Mode::Emulate
             || (self.wave64 == Wave64Mode::Wave32 && self.total_threads > 32)
     }
@@ -1206,10 +1202,10 @@ impl<'a> Lower<'a> {
             self.s.flags |= flags::WAVE_OPS;
             self.s.m.bin(e, Bin::Add, base, lane)
         };
-        let k63 = self.s.m.i32(63);
-        let k6 = self.s.m.i32(6);
-        let console_lane = self.s.m.bin(e, Bin::And, flat, k63);
-        let vwave = self.s.m.bin(e, Bin::LShr, flat, k6);
+        let mask = self.s.m.i32(self.wave() - 1);
+        let shift = self.s.m.i32(self.wave().ilog2());
+        let console_lane = self.s.m.bin(e, Bin::And, flat, mask);
+        let vwave = self.s.m.bin(e, Bin::LShr, flat, shift);
         let ids = (flat, console_lane, vwave);
         self.wave_ids = Some(ids);
         ids
@@ -1229,11 +1225,11 @@ impl<'a> Lower<'a> {
         self.s.m.element(block, lds, idx)
     }
 
-    /// Pointer to LDS exchange dword `exchange_base + vwave * 64 + lane_offset`.
+    /// Pointer to a lane's LDS exchange dword in its virtual wave.
     fn exchange_ptr(&mut self, block: usize, vwave: V, lane_offset: V) -> V {
         let base_v = self.s.m.i32(self.exchange_base);
-        let k64 = self.s.m.i32(64);
-        let wave_off = self.s.m.bin(block, Bin::Mul, vwave, k64);
+        let width = self.s.m.i32(self.wave());
+        let wave_off = self.s.m.bin(block, Bin::Mul, vwave, width);
         let row = self.s.m.bin(block, Bin::Add, base_v, wave_off);
         let idx = self.s.m.bin(block, Bin::Add, row, lane_offset);
         let lds = self.s.lds();
@@ -1325,9 +1321,9 @@ impl<'a> Lower<'a> {
         Ok((self.s.m.load(c, r0_ptr), self.s.m.load(c, r1_ptr)))
     }
 
-    /// Exchanges `val` from every console lane across the virtual 64-lane wave via LDS
+    /// Exchanges `val` from every console lane across the virtual wave via LDS
     /// and returns the value held by `lane`. Requires a uniform block.
-    fn exchange_64(&mut self, val: V, lane: V) -> Result<V, Why> {
+    fn exchange_lanes(&mut self, val: V, lane: V) -> Result<V, Why> {
         if self.guard_depth > 0 || !self.uniform.get(self.cur_ir).copied().unwrap_or(false) {
             return Err("a cross-lane read in divergent control flow");
         }
@@ -1336,13 +1332,13 @@ impl<'a> Lower<'a> {
         let wptr = self.exchange_ptr(self.cur, vwave, console_lane);
         self.s.m.store(self.cur, wptr, val);
         self.lds_barrier(self.cur);
-        let k63 = self.s.m.i32(63);
-        let idx = self.s.m.bin(self.cur, Bin::And, lane, k63);
+        let mask = self.s.m.i32(self.wave() - 1);
+        let idx = self.s.m.bin(self.cur, Bin::And, lane, mask);
         let rptr = self.exchange_ptr(self.cur, vwave, idx);
         Ok(self.s.m.load(self.cur, rptr))
     }
 
-    /// Emulates `v_readfirstlane_b32(val)` across all 64 lanes of a virtual wave.
+    /// Emulates `v_readfirstlane_b32(val)` across a virtual wave.
     fn emulated_readfirstlane(&mut self, val: V, guard: Option<V>) -> Result<V, Why> {
         if self.guard_depth > 0 || !self.uniform.get(self.cur_ir).copied().unwrap_or(false) {
             return Err("v_readfirstlane in divergent control flow");
@@ -1462,7 +1458,7 @@ impl<'a> Lower<'a> {
         }
     }
 
-    /// Materializes 64-lane ballots needed as data or opaque guards by `(b, i)` before `inst` runs.
+    /// Materializes virtual wave ballots needed as data or opaque guards before `(b, i)` runs.
     fn materialize_masks(&mut self, b: usize, i: usize, inst: &Inst) {
         let mut todo = Vec::new();
         let mut add = |v: Value| {
@@ -1495,7 +1491,7 @@ impl<'a> Lower<'a> {
         }
     }
 
-    /// Emits a 64-lane ballot for active mask `lo` into `self.cur`.
+    /// Emits a ballot for active mask `lo` into `self.cur`.
     fn compute_ballot_in_cur(&mut self, lo: Value, uniform_here: bool) -> Result<(V, V), Why> {
         let &m = self.x.st.masks.get(&lo).ok_or(LANE_MASK)?;
         if !self.x.st.active.contains(&lo) {
@@ -1510,7 +1506,7 @@ impl<'a> Lower<'a> {
         let bit = bit?;
         let xy = if self.wave64 == Wave64Mode::Emulate {
             if self.guard_depth > 0 || !uniform_here {
-                return Err("a 64-lane wave ballot in divergent control flow");
+                return Err("a virtual wave ballot in divergent control flow");
             }
             let (_, console_lane, vwave) = self.ensure_wave_ids();
             let base = self.ballot_base;
@@ -1634,13 +1630,14 @@ impl<'a> Lower<'a> {
                 return Err("a wave reduction in divergent control flow");
             }
             let (_, console_lane, vwave) = self.ensure_wave_ids();
-            let max_in_vwave = self.total_threads.min(64);
+            let wave = self.wave();
+            let max_in_vwave = self.total_threads.min(wave);
             if let Some(inclusive) = prefix {
                 if !matches!(op, Op::AddU | Op::AddF) {
                     return Err("a wave prefix of an operation other than a sum");
                 }
                 let mut cur_val = x;
-                for shift in 0..6 {
+                for shift in 0..wave.ilog2() {
                     let stride = 1u32 << shift;
                     if stride >= max_in_vwave {
                         break;
@@ -1677,10 +1674,10 @@ impl<'a> Lower<'a> {
                 self.lds_barrier(self.cur);
                 let wp = self.exchange_ptr(self.cur, vwave, console_lane);
                 self.s.m.store(self.cur, wp, x);
-                let partial = !self.total_threads.is_multiple_of(64);
+                let partial = !self.total_threads.is_multiple_of(wave);
                 let (flat, _, _) = self.ensure_wave_ids();
                 let total_v = self.s.m.i32(self.total_threads);
-                for shift in (0..6).rev() {
+                for shift in (0..wave.ilog2()).rev() {
                     let stride = 1u32 << shift;
                     if stride >= max_in_vwave {
                         continue;
@@ -1730,7 +1727,7 @@ impl<'a> Lower<'a> {
                     121,
                     &[arg, k0, k1],
                 );
-                if self.emulating_wave64() {
+                if self.emulating_wave() {
                     if self.guard_depth > 0
                         || !self.uniform.get(self.cur_ir).copied().unwrap_or(false)
                     {
@@ -1799,7 +1796,7 @@ impl<'a> Lower<'a> {
             }
         };
         let local_bits = if float { self.as_int(r) } else { r };
-        if self.emulating_wave64() {
+        if self.emulating_wave() {
             let uniform_here = self.uniform.get(self.cur_ir).copied().unwrap_or(false);
             let (h0, h1) = self.exchange_two_halves(local_bits, id, uniform_here)?;
             return Ok(self.apply_wave_op(op, h0, h1));
@@ -1809,7 +1806,7 @@ impl<'a> Lower<'a> {
 
     fn run(mut self) -> Result<Lowered, Stop> {
         if self.lds_overflow {
-            return Err(unsupported(0, "LDS exceeding 32 KiB with wave64 emulation"));
+            return Err(unsupported(0, "LDS exceeding 32 KiB with wave emulation"));
         }
         let p = self.x.p;
         let order = crate::ir::reverse_postorder(&p.blocks);
@@ -1837,7 +1834,7 @@ impl<'a> Lower<'a> {
         }
         self.cur = self.s.entry;
         self.inputs()?;
-        if self.emulating_wave64() {
+        if self.emulating_wave() {
             self.ensure_wave_ids();
             self.preemit_masks(None);
         }
@@ -1885,7 +1882,7 @@ impl<'a> Lower<'a> {
                 i += 1;
             }
             self.mask_ok = self.mask_data == MaskData::Console;
-            if self.emulating_wave64() {
+            if self.emulating_wave() {
                 self.preemit_masks(Some(b));
             }
             self.tail[b] = Some(self.cur);
@@ -2183,16 +2180,16 @@ impl<'a> Lower<'a> {
         let (x, y) = match self.ballots.get(&lo) {
             Some(&xy) => xy,
             None => {
-                if self.emulating_wave64() {
+                if self.emulating_wave() {
                     match self.def_block.get(&lo).copied() {
                         Some(b) if b == self.cur_ir => {
                             let uniform_here = self.uniform.get(b).copied().unwrap_or(false);
                             self.compute_ballot_in_cur(lo, uniform_here)?
                         }
                         Some(b) if !self.uniform.get(b).copied().unwrap_or(false) => {
-                            return Err("a 64-lane wave ballot in divergent control flow");
+                            return Err("a virtual wave ballot in divergent control flow");
                         }
-                        None => return Err("a 64-lane wave ballot outside uniform entry"),
+                        None => return Err("a virtual wave ballot outside uniform entry"),
                         _ => return Err("a lane mask written after its use"),
                     }
                 } else {
@@ -2626,7 +2623,7 @@ impl<'a> Lower<'a> {
 
     /// This lane's bit of the mask `lo`, `hi` (wave64).
     fn lane_bit(&mut self, at: usize, lo: V, hi: Option<V>) -> V {
-        let lane = if self.s.threads.is_some() && self.emulating_wave64() {
+        let lane = if self.s.threads.is_some() && self.emulating_wave() {
             self.ensure_wave_ids().1
         } else {
             self.s.op(
@@ -2858,7 +2855,7 @@ impl<'a> Lower<'a> {
         if self.s.threads.is_none() && !(quad && self.s.pixel) {
             return Err("a cross-lane operation outside compute");
         }
-        debug_assert!(self.s.threads.is_none() || self.console_lanes || self.emulating_wave64());
+        debug_assert!(self.s.threads.is_none() || self.console_lanes || self.emulating_wave());
         if self.wave64 != Wave64Mode::Emulate {
             self.s.flags |= flags::WAVE_OPS;
         }
@@ -2871,7 +2868,7 @@ impl<'a> Lower<'a> {
     /// plus the lane index. (A bijection while each host wave holds a
     /// wave-aligned run of flat ids, as the console's waves do.)
     fn thread_id(&mut self, c: u8) -> Val {
-        if !self.console_lanes && !self.emulating_wave64() {
+        if !self.console_lanes && !self.emulating_wave() {
             return self.compute_id("threadIdInGroup.i32", 95, c);
         }
         let [x, y, _] = self.s.threads.expect("compute");
@@ -2971,7 +2968,7 @@ impl<'a> Lower<'a> {
             let m = self.s.m.i32(self.wave() - 1);
             return self.s.m.bin(self.s.entry, Bin::And, f, m);
         }
-        if self.emulating_wave64() {
+        if self.emulating_wave() {
             return self.ensure_wave_ids().1;
         }
         self.host_lane_index()
@@ -3098,7 +3095,7 @@ impl<'a> Lower<'a> {
             let r = if mesh_quad {
                 self.quad_pick(x, src)
             } else if self.wave64 == Wave64Mode::Emulate {
-                self.exchange_64(x, src)?
+                self.exchange_lanes(x, src)?
             } else {
                 self.read_lane(x, src)
             };
@@ -3252,7 +3249,7 @@ impl<'a> Lower<'a> {
             }
             MaskData::None => false,
         };
-        if self.emulating_wave64() {
+        if self.emulating_wave() {
             self.materialize_masks(b, i, inst);
         }
         let effect = matches!(inst.fields, Fields::Exp { .. })
@@ -4499,7 +4496,7 @@ impl<'a> Lower<'a> {
         } else {
             self.host_lane_index()
         };
-        let mask_lane = if !emulate && self.s.mesh.is_none() && self.emulating_wave64() {
+        let mask_lane = if !emulate && self.s.mesh.is_none() && self.emulating_wave() {
             self.lane_index()
         } else {
             lane
@@ -4580,7 +4577,7 @@ impl<'a> Lower<'a> {
         let mut r = if mesh_quad {
             self.quad_pick(x, src)
         } else if emulate {
-            self.exchange_64(x, src)?
+            self.exchange_lanes(x, src)?
         } else {
             self.read_lane(x, src)
         };
@@ -5099,9 +5096,9 @@ impl<'a> Lower<'a> {
                     return int(self, r);
                 }
                 let (a, lane) = (s(self, 0)?, s(self, 1)?);
-                if self.emulating_wave64() {
+                if self.emulating_wave() {
                     self.cross_lane(false)?;
-                    let r = self.exchange_64(a, lane)?;
+                    let r = self.exchange_lanes(a, lane)?;
                     return int(self, r);
                 }
                 if self.wave64 == Wave64Mode::Wave32
@@ -5118,6 +5115,12 @@ impl<'a> Lower<'a> {
                 } else {
                     self.cross_lane(false)?;
                 }
+                let lane = if self.s.threads.is_some() {
+                    let mask = self.s.m.i32(self.wave() - 1);
+                    self.s.m.bin(c, Bin::And, lane, mask)
+                } else {
+                    lane
+                };
                 let r = self.read_lane(a, lane);
                 int(self, r)
             }
@@ -5133,6 +5136,8 @@ impl<'a> Lower<'a> {
                 };
                 self.cross_lane(false)?;
                 let me = self.lane_index();
+                let mask = self.s.m.i32(self.wave() - 1);
+                let lane = self.s.m.bin(c, Bin::And, lane, mask);
                 let is = self.s.m.cmp(c, pred::EQ, me, lane);
                 let r = self.s.m.select(c, is, a, old);
                 int(self, r)
@@ -5149,7 +5154,7 @@ impl<'a> Lower<'a> {
                     }),
                     _ => false,
                 });
-                if self.emulating_wave64() && (self.console_lanes || non_uniform) {
+                if self.emulating_wave() && (self.console_lanes || non_uniform) {
                     self.cross_lane(false)?;
                     let r = self.emulated_readfirstlane(a, guard)?;
                     return int(self, r);
@@ -7539,7 +7544,7 @@ impl<'a> Lower<'a> {
     }
 
     fn exit(&mut self, b: usize) -> Result<(), Stop> {
-        if self.emulating_wave64()
+        if self.emulating_wave()
             && let LaneExit::Branch { when, .. } = self.x.st.exits[b]
         {
             let mut todo = Vec::new();
