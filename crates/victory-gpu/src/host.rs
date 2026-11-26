@@ -481,14 +481,6 @@ enum Step {
     Texture(std::sync::Arc<crate::texture::Staging>),
 }
 
-/// A piece of a query result: the title's address, the offset it has in
-/// the read-back buffer, and its width.
-type Target = (usize, u64, usize);
-
-/// A read-back buffer and the pieces of its resolved queries that go back
-/// into the title's memory.
-type Resolved = (ID3D12Resource, Vec<Target>);
-
 /// What a list does on the CPU when it is submitted: copies between host
 /// memory regions (title buffers, upload buffers and buffer copies), and
 /// the upload buffers its GPU commands read, kept until the list is reset.
@@ -509,10 +501,7 @@ struct Deferred {
     /// Bottom-of-pipe writes, done once the list has run: address, what,
     /// bytes.
     writes: Vec<(usize, crate::queue::Written, usize)>,
-    /// Query results the list resolved into a read-back buffer, written to
-    /// the title's memory once the list has run: the buffer, then each
-    /// (destination, offset in the buffer, bytes).
-    resolves: Vec<Resolved>,
+    queries: crate::query::Recording,
     /// Whether a step zeroes the indirect-work budget.
     budget_zeroed: bool,
 }
@@ -628,6 +617,7 @@ impl Host {
         };
         #[cfg(not(feature = "diagnostics"))]
         let groups = [&lists[..]];
+        let mut completed = true;
         for (i, group) in groups.iter().enumerate() {
             *submitted += 1;
             let started = std::time::Instant::now();
@@ -651,11 +641,14 @@ impl Host {
                 match waited {
                     #[cfg(windows)]
                     Ok(()) => {
-                        WaitForSingleObject(self.event, INFINITE);
+                        completed &= WaitForSingleObject(self.event, INFINITE).0 == 0;
                     }
                     #[cfg(not(windows))]
                     Ok(()) => {}
-                    Err(e) => tracing::warn!(error = %e, "host submission not waited for"),
+                    Err(e) => {
+                        completed = false;
+                        tracing::warn!(error = %e, "host submission not waited for");
+                    }
                 }
             }
             #[cfg(feature = "diagnostics")]
@@ -718,42 +711,9 @@ impl Host {
         }
         COPY_BACK[0].fetch_add(copying.elapsed().as_micros() as u64, Ordering::Relaxed);
         for list in runs {
-            // Query results first: a bottom-of-pipe write may name the same
-            // memory (a buffer the title both resolves into and advances).
-            for (readback, targets) in &list.deferred().resolves {
-                let mut data = std::ptr::null_mut();
-                let end = targets
-                    .iter()
-                    .map(|&(_, offset, bytes)| offset + bytes as u64)
-                    .max()
-                    .unwrap_or(0);
-                let range = D3D12_RANGE {
-                    Begin: 0,
-                    End: end as usize,
-                };
-                // SAFETY: a read-back buffer the finished list resolved
-                // into; `end` is inside it (the resolve checked the
-                // title's own buffer, and the buffer was made that size).
-                if unsafe { readback.Map(0, Some(&range), Some(&mut data)) }.is_err() {
-                    continue;
-                }
-                for &(at, offset, bytes) in targets {
-                    // SAFETY: reading a u64 at a checked offset of the
-                    // mapped buffer, and writing into title memory.
-                    unsafe {
-                        let value =
-                            std::ptr::read_unaligned(data.add(offset as usize).cast::<u64>());
-                        if bytes == 4 {
-                            (at as *mut u32).write_unaligned(value as u32);
-                        } else {
-                            (at as *mut u64).write_unaligned(value);
-                        }
-                    }
-                }
-                // SAFETY: the same buffer, unmapped once.
-                unsafe { readback.Unmap(0, None) };
-            }
-            for &(at, what, bytes) in &list.deferred().writes {
+            let mut deferred = list.deferred();
+            deferred.queries.complete(completed);
+            for &(at, what, bytes) in &deferred.writes {
                 what.write(at as *mut u8, bytes);
             }
         }
@@ -1043,6 +1003,7 @@ impl HostList {
     }
 
     pub(crate) fn close(&self) {
+        self.deferred().queries.close(&self.list);
         #[cfg(feature = "diagnostics")]
         if timing() {
             let count = self.notes.lock().unwrap_or_else(|e| e.into_inner()).len() as u32;
@@ -1068,7 +1029,13 @@ impl HostList {
     /// Only after the list's last submission finished (every one is waited
     /// for).
     pub(crate) fn reset(&self) {
-        *self.deferred() = Deferred::default();
+        {
+            let mut deferred = self.deferred();
+            *deferred = Deferred {
+                queries: deferred.queries.reset(),
+                ..Deferred::default()
+            };
+        }
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
         #[cfg(feature = "diagnostics")]
@@ -1256,16 +1223,23 @@ impl HostList {
         self.deferred().writes.push((dst as usize, what, bytes));
     }
 
-    /// Records that the list resolved query results into `readback`, and
-    /// that each (destination, offset, bytes) of `targets` is written from
-    /// it once the list has run. The buffer is kept until the list is
-    /// reset, because its contents are only valid after the wait.
-    pub(crate) fn defer_resolve(
+    pub(crate) fn mark_query(&self, heap: crate::object::This, kind: u32, index: u32, begin: bool) {
+        self.deferred().queries.mark(&self.list, heap, kind, index, begin);
+    }
+
+    pub(crate) fn resolve_queries(
         &self,
-        readback: windows::Win32::Graphics::Direct3D12::ID3D12Resource,
-        targets: Vec<Target>,
+        heap: crate::object::This,
+        kind: u32,
+        first: u32,
+        count: u32,
+        dst: *mut u8,
     ) {
-        self.deferred().resolves.push((readback, targets));
+        self.deferred().queries.resolve(heap, kind, first, count, dst);
+    }
+
+    pub(crate) fn missed_draw(&self) {
+        self.deferred().queries.missed_draw();
     }
 
     /// A mapped upload buffer of `size` bytes, alive until the list is
