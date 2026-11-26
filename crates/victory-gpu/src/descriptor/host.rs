@@ -6,6 +6,7 @@
 //! reads it through a table and finds the slot changed.
 
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
@@ -15,6 +16,7 @@ use crate::host::host;
 
 pub(crate) struct HostHeap {
     pub(crate) heap: ID3D12DescriptorHeap,
+    id: u64,
     cpu: usize,
     step: u32,
     /// Slots mirroring the title's; view heaps have `dynamic` more.
@@ -32,6 +34,8 @@ pub(crate) struct HostHeap {
     kept: Mutex<Vec<Option<ID3D12Resource>>>,
     slots: Mutex<DynamicSlots>,
 }
+
+static NEXT_HEAP_ID: AtomicU64 = AtomicU64::new(1);
 
 struct DynamicSlots {
     next: usize,
@@ -144,6 +148,7 @@ impl HostHeap {
         ));
         let h = HostHeap {
             heap,
+            id: NEXT_HEAP_ID.fetch_add(1, Ordering::Relaxed),
             cpu,
             step,
             count,
@@ -280,6 +285,10 @@ impl HostHeap {
     /// when the host caps its size.
     pub(crate) fn count(&self) -> u32 {
         self.count
+    }
+
+    pub(crate) fn id(&self) -> u64 {
+        self.id
     }
 
     /// Gives back `n` dynamic slots from `first` (an index [`dynamic`]

@@ -74,17 +74,17 @@ pub(crate) struct State {
     /// Tables made afresh in this list: (table, what it holds) → first
     /// dynamic slot.
     fresh_tables: std::collections::HashMap<(u64, u64), u32>,
-    /// The dynamic slots the list holds: title heap, first, count; given
+    /// The dynamic slots the list holds: title heap, host ID, first, count; given
     /// back when the list is reset or released.
-    dynamic: Vec<(usize, u32, u32)>,
+    dynamic: Vec<(usize, u64, u32, u32)>,
     /// A fresh table of the stage being bound could not be made.
     table_failed: bool,
 }
 
 impl Drop for State {
     fn drop(&mut self) {
-        for &(heap, first, n) in &self.dynamic {
-            crate::descriptor::release_dynamic(heap, first, n);
+        for &(heap, id, first, n) in &self.dynamic {
+            crate::descriptor::release_dynamic(heap, id, first, n);
         }
     }
 }
@@ -765,7 +765,7 @@ impl State {
             };
             self.fresh_tables.insert(key, first);
             self.dynamic
-                .push((std::ptr::from_ref(heap) as usize, first, n));
+                .push((std::ptr::from_ref(heap) as usize, host.id(), first, n));
             // The whole range: a shader may index past the entries its
             // used-resource list names (descriptor arrays).
             for k in 0..n {
@@ -1259,7 +1259,7 @@ mod tests {
             assert!(list.gpu_written(&shadow.buffer));
             assert_eq!((first.len(), second.len()), (1, 1));
             assert_eq!(first == second, !spans.is_empty());
-            assert_eq!(state.dynamic.iter().map(|&(_, _, n)| n).sum::<u32>(), expected_slots);
+            assert_eq!(state.dynamic.iter().map(|&(_, _, _, n)| n).sum::<u32>(), expected_slots);
             list.close();
         }
         crate::shadow::unregister(start as usize, start);
