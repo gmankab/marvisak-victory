@@ -2896,6 +2896,68 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
 mod device_tests {
     use super::*;
 
+    #[cfg(not(windows))]
+    #[test]
+    #[ignore = "needs a D3D12 device with host pointer import"]
+    fn gpu_reads_linux_guest_pages_directly() {
+        use victory_loader::linux::vm;
+
+        const HEAP_SIZE: usize = 64 << 10;
+        const BYTES: usize = 256;
+        let host = host().expect("D3D12 device");
+        let device = host.device.cast::<ID3D12Device13>().expect("D3D12 device13");
+        let base = vm::alloc(0, HEAP_SIZE, vm::MEM_COMMIT, vm::PAGE_READWRITE, vm::PAGE).unwrap();
+        // SAFETY: a committed aligned allocation kept until after the heap and buffer are released.
+        let heap: ID3D12Heap = unsafe { device.OpenExistingHeapFromAddress1(base as *const _, HEAP_SIZE) }
+            .expect("import guest heap");
+        // SAFETY: plain query on a live heap.
+        assert_ne!(unsafe { heap.GetDesc() }.Flags & D3D12_HEAP_FLAG_SHARED_CROSS_ADAPTER, D3D12_HEAP_FLAG_NONE);
+        let mut source: Option<ID3D12Resource> = None;
+        // SAFETY: a buffer fitting entirely in the live imported heap.
+        unsafe {
+            host.device.CreatePlacedResource(
+                &heap,
+                0,
+                &D3D12_RESOURCE_DESC {
+                    Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                    Width: HEAP_SIZE as u64,
+                    Height: 1,
+                    DepthOrArraySize: 1,
+                    MipLevels: 1,
+                    SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                    Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                    Flags: D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER,
+                    ..Default::default()
+                },
+                D3D12_RESOURCE_STATE_COPY_SOURCE,
+                None,
+                &mut source,
+            )
+        }.expect("buffer in imported heap");
+        let source = source.unwrap();
+        let readback = host.readback_buffer(BYTES as u64).unwrap();
+        for value in [23, 81] {
+            let list = host.new_list().unwrap();
+            // SAFETY: a committed guest mapping, and live source and destination buffers.
+            unsafe {
+                (base as *mut u8).write_bytes(value, BYTES);
+                list.list.CopyBufferRegion(&readback, 0, &source, 0, BYTES as u64);
+            }
+            list.close();
+            host.execute(&[&list]);
+            let mut mapped = std::ptr::null_mut();
+            // SAFETY: the submission is complete and readback is no longer being filled.
+            unsafe {
+                readback.Map(0, None, Some(&mut mapped)).unwrap();
+                assert_eq!(std::slice::from_raw_parts(mapped.cast::<u8>(), BYTES), &[value; BYTES]);
+                readback.Unmap(0, Some(&D3D12_RANGE { Begin: 0, End: 0 }));
+            }
+        }
+        drop(source);
+        drop(heap);
+        vm::free(base, 0, vm::MEM_RELEASE).unwrap();
+    }
+
     #[test]
     #[ignore = "needs a D3D12 device"]
     fn replaced_resource_survives_until_the_retirement_fence() {
