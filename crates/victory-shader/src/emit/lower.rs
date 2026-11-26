@@ -20,6 +20,8 @@ use crate::native::{HwStage, NativeProgram, ResourceType, RootType, StageIo, Usa
 use crate::resource::{Address, CODE, Moved, Resources, Role, Site, Source, spilled_sgprs};
 use crate::structure::{Atom, Bool, LaneExit, Structured};
 
+mod dead_edge;
+
 type Why = &'static str;
 
 #[derive(Debug, Clone, Copy)]
@@ -8248,6 +8250,14 @@ impl<'a> Lower<'a> {
                     (Some(Val::Bit(_)), false) if self.read_phis.contains(&phi.value) => {
                         return Err(Stop::Retry(phi.value, "an SCC joined with SGPR values"));
                     }
+                    (Some(Val::Missing(_)), false)
+                        if self.read_phis.contains(&phi.value)
+                            && matches!(phi.reg, Reg::S(0..=105))
+                            && !self.x.console_flow
+                            && self.dead_on_edge(b, n, phi.reg) =>
+                    {
+                        self.s.m.i32(0)
+                    }
                     (Some(Val::Missing(why)), _) if self.read_phis.contains(&phi.value) => {
                         return Err(Stop::Retry(phi.value, why));
                     }
@@ -8294,6 +8304,10 @@ mod tests {
 
     /// Lowers a compute program of constants: whether it translates.
     fn lowers(words: &[u32]) -> Result<(), crate::ShaderError> {
+        lowers_with_inputs(words, 0)
+    }
+
+    fn lowers_with_inputs(words: &[u32], rsrc2: u32) -> Result<(), crate::ShaderError> {
         let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
         let native = NativeProgram {
             stage: HwStage::Cs,
@@ -8302,7 +8316,7 @@ mod tests {
             layout: vec![],
             used: vec![],
             io: StageIo::Cs(ComputeIo {
-                rsrc2: 0,
+                rsrc2,
                 threads: [1, 1, 1],
             }),
             code,
@@ -8325,6 +8339,38 @@ mod tests {
             console_flow: false,
         })
         .map(|_| ())
+    }
+
+    #[test]
+    fn a_missing_scalar_phi_input_requires_a_path_to_a_read() {
+        let mut words = [
+            0xF490_0180,
+            0,           // s_memtime s[6:7]
+            0x7E02_0280, // v_mov_b32 v1, 0
+            0xBF06_8000, // s_cmp_eq_u32 s0, 0 (group ID X)
+            0xBF85_0002, // s_cbranch_scc1 -> join
+            0xBE86_0385, // s_mov_b32 s6, 5
+            0x7E02_02C1, // v_mov_b32 v1, -1
+            0x7D84_02C1, // join: v_cmp_eq_u32 vcc_lo, -1, v1
+            0xBF86_0003, // s_cbranch_vccz -> after
+            0xBF07_8006, // s_cmp_lg_u32 s6, 0
+            0xBF85_0001, // s_cbranch_scc1 -> after
+            0xBE84_0380, // s_mov_b32 s4, 0
+            0x7DA4_0080, // after: v_cmpx_eq_u32 exec_lo, 0, v0
+            0x7E0C_0500, // v_readfirstlane_b32 s6, v0
+            0x7DA4_0006, // v_cmpx_eq_u32 exec_lo, s6, v0
+            0xBEFE_03C1, // s_mov_b32 exec_lo, -1
+            S_ENDPGM,
+        ];
+        let group_ids_xy = 3 << 7;
+        lowers_with_inputs(&words, group_ids_xy).expect("the live lane reads the overwritten SGPR");
+
+        let mut no_overwrite = words;
+        no_overwrite[13] = 0xBF80_0000; // s_nop 0
+        assert!(lowers_with_inputs(&no_overwrite, group_ids_xy).is_err());
+
+        words[2] = 0x7E02_02C1; // Set the flag even when s6 retains the timestamp.
+        assert!(lowers_with_inputs(&words, group_ids_xy).is_err());
     }
 
     #[test]
