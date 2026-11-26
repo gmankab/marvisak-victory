@@ -297,6 +297,50 @@ impl<'a> Pack<'a> {
     }
 }
 
+/// The pack in `file`: the file itself, or the pack an archive holds as a
+/// run of zlib streams (each starting at a multiple of 16 bytes and
+/// inflating to at most 64 KiB), found by its magic.
+pub fn find(file: &[u8]) -> Option<std::borrow::Cow<'_, [u8]>> {
+    if file.starts_with(MAGIC) {
+        return Some(std::borrow::Cow::Borrowed(file));
+    }
+    let mut chunk = vec![0u8; 0x20000];
+    // One zlib stream at `at`: its output and the bytes it took.
+    let mut inflate = |at: usize| {
+        use miniz_oxide::inflate::core::{DecompressorOxide, decompress, inflate_flags};
+        use miniz_oxide::inflate::TINFLStatus;
+        let flags = inflate_flags::TINFL_FLAG_PARSE_ZLIB_HEADER
+            | inflate_flags::TINFL_FLAG_USING_NON_WRAPPING_OUTPUT_BUF;
+        let (status, used, out) =
+            decompress(&mut DecompressorOxide::new(), file.get(at..)?, &mut chunk, 0, flags);
+        (status == TINFLStatus::Done).then(|| (chunk[..out].to_vec(), used))
+    };
+    let zlib = |at: usize| {
+        file[at] == 0x78 && u16::from_be_bytes([file[at], file[at + 1]]).is_multiple_of(31)
+    };
+    let start = (0..file.len().saturating_sub(1))
+        .step_by(16)
+        .filter(|&at| zlib(at))
+        .find_map(|at| inflate(at).filter(|(out, _)| out.starts_with(MAGIC)).map(|o| (at, o)))?;
+    let (mut at, (mut pack, used)) = start;
+    at += used;
+    let size = |p: &[u8]| -> Option<usize> {
+        let n = |o: usize| u32_at(p, o).map(|v| v as usize);
+        let tables = n(0x50)? * GRAPHICS + n(0x54)? * COMPUTE + (n(0x58)? + n(0x5c)?) * 8;
+        Some(HEADER + tables + n(0x60)? + n(0x64)?)
+    };
+    loop {
+        // The header gives the size once it is whole.
+        if let Some(total) = size(&pack).filter(|&t| pack.len() >= t) {
+            return (pack.len() == total).then_some(std::borrow::Cow::Owned(pack));
+        }
+        at = at.next_multiple_of(16);
+        let (out, used) = inflate(at)?;
+        pack.extend(out);
+        at += used;
+    }
+}
+
 /// The two 12-byte instructions a native program starts with, which carry
 /// its shader's hash: equal for the pack's program and the database
 /// container it was compiled from.
@@ -422,6 +466,23 @@ mod tests {
         assert_eq!(c[0].shader_hash, 0x2222);
         assert_eq!((c[0].packet.len(), c[0].metadata.len()), (28, 20));
         assert_eq!((c[0].stage.program, c[0].stage.metadata), (&[2; 12][..], None));
+    }
+
+    #[test]
+    fn finds_a_pack_inside_an_archive() {
+        let pack = pack_bytes();
+        // Junk (with a zlib stream of something else), then the pack in
+        // chunks of 100 bytes, each stream at a multiple of 16.
+        let mut archive = vec![0x5A; 0x103];
+        archive.extend(miniz_oxide::deflate::compress_to_vec_zlib(b"not a pack", 6));
+        for part in pack.chunks(100) {
+            archive.resize(archive.len().next_multiple_of(16), 0);
+            archive.extend(miniz_oxide::deflate::compress_to_vec_zlib(part, 6));
+        }
+        archive.extend([0; 40]);
+        assert_eq!(find(&archive).as_deref(), Some(&pack[..]));
+        assert_eq!(find(&pack).as_deref(), Some(&pack[..]));
+        assert!(find(&archive[..archive.len() - 200]).is_none());
     }
 
     #[test]
