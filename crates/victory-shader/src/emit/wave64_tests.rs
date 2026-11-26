@@ -453,16 +453,55 @@ fn translate_with_handles_synthetic_wave64_container() {
     assert_eq!(psv_wave_range(&sh_emu), (0, u32::MAX));
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 mod gpu {
     use std::sync::{Mutex, OnceLock};
 
     use super::*;
     use crate::emit::host::{Dispatch, Host, View};
 
+    #[cfg(target_os = "linux")]
+    fn native_host() -> Result<Host, String> {
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
+        use windows::Win32::Graphics::Direct3D12::ID3D12Device;
+        use windows::core::{HRESULT, Interface};
+
+        let mut device = std::ptr::null_mut();
+        // SAFETY: the interface ID and output slot match ID3D12Device.
+        unsafe {
+            HRESULT(crate::hostlib::create_device(
+                D3D_FEATURE_LEVEL_12_0.0,
+                std::ptr::from_ref(&ID3D12Device::IID).cast(),
+                &mut device,
+            )?)
+            .ok()
+            .map_err(|error| error.to_string())?;
+            if device.is_null() {
+                return Err("device creation returned no interface".into());
+            }
+            Ok(Host {
+                device: ID3D12Device::from_raw(device),
+            })
+        }
+    }
+
     fn with_hosts(f: impl FnOnce(&[Option<Host>; 2])) {
         static HOSTS: OnceLock<Mutex<[Option<Host>; 2]>> = OnceLock::new();
-        let lock = HOSTS.get_or_init(|| Mutex::new([Host::new(false).ok(), Host::new(true).ok()]));
+        let lock = HOSTS.get_or_init(|| {
+            #[cfg(windows)]
+            let host = Host::new(false);
+            // Native readbacks verify each PSO directly, including on a
+            // backend that advertises a lower aggregate shader model.
+            #[cfg(target_os = "linux")]
+            let host = native_host();
+            #[cfg(target_os = "linux")]
+            if std::env::var_os("VICTORY_VKD3D").is_some()
+                && let Err(error) = &host
+            {
+                panic!("configured native D3D12 backend unavailable: {error}");
+            }
+            Mutex::new([host.ok(), Host::new(true).ok()])
+        });
         let guard = lock.lock().unwrap_or_else(|e| e.into_inner());
         f(&guard);
     }
