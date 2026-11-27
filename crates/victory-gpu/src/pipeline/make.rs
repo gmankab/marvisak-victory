@@ -29,9 +29,10 @@ pub(crate) struct Pending {
     pub(crate) graphics: Option<Box<GraphicsState>>,
     queued: AtomicBool,
     made: OnceLock<Option<HostPipeline>>,
-    /// What identifies it across runs (shader containers and state), and
-    /// whether a draw has used it yet.
+    /// What identifies it across runs (shader containers and state).
     pub(crate) key: String,
+    requested: AtomicBool,
+    #[cfg(feature = "diagnostics")]
     used: AtomicBool,
 }
 
@@ -55,6 +56,8 @@ impl Pending {
             graphics,
             queued: AtomicBool::new(false),
             made: OnceLock::new(),
+            requested: AtomicBool::new(false),
+            #[cfg(feature = "diagnostics")]
             used: AtomicBool::new(false),
         }
     }
@@ -117,10 +120,10 @@ pub(crate) fn log_built(key: &str) {
 }
 
 /// `VICTORY_PIPELINE_LOG=<file>` (diagnostics): a line per title pipeline
-/// key created (`created`, its shaders, its state as described) and first
-/// drawn or dispatched with (`used`), and its host pipeline's library name
-/// once made or loaded (`built`, also from the pre-build), to compare what
-/// a run creates with what the pre-build makes.
+/// key created (`created`, its shaders, its state as described), first
+/// requested (`requested`) and first available to a draw or dispatch (`used`).
+/// The host pipeline's library name is logged once made or loaded (`built`,
+/// also from the pre-build).
 #[cfg(feature = "diagnostics")]
 fn log(what: &str, key: &str, rest: impl FnOnce() -> String) {
     use std::collections::HashSet;
@@ -157,14 +160,23 @@ pub(crate) fn waiting() -> u64 {
 /// The host pipeline if it is made (or is made within the frame's budget);
 /// queues it on first use.
 pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
+    // A one-time pass can exhaust its wait budget before the host pipeline
+    // is ready. Its first request still belongs in the next launch's list.
+    if !p.requested.load(Ordering::Relaxed)
+        && !p.shaders.is_empty()
+        && !p.requested.swap(true, Ordering::Relaxed)
+    {
+        super::library::note_requested(&p.key);
+        #[cfg(feature = "diagnostics")]
+        log("requested", &p.key, String::new);
+    }
     if p.made.get().is_none() {
         start(p);
         wait(p, crate::frame::current());
     }
     let made = p.made.get()?.as_ref();
-    if made.is_some() && !p.used.swap(true, Ordering::Relaxed) {
-        super::library::note_used(&p.key);
-        #[cfg(feature = "diagnostics")]
+    #[cfg(feature = "diagnostics")]
+    if made.is_some() && !p.used.load(Ordering::Relaxed) && !p.used.swap(true, Ordering::Relaxed) {
         log("used", &p.key, String::new);
     }
     made
@@ -178,8 +190,7 @@ fn start(p: &Arc<Pending>) {
     }
 }
 
-/// At the title's creation of a pipeline: starts it at once if an earlier
-/// run drew with it (during loading, so the world's first frames find it).
+/// Starts a pipeline at creation if an earlier run requested it.
 pub(crate) fn early(p: &Arc<Pending>) {
     if !p.shaders.is_empty() && super::library::wanted_early(&p.key) {
         super::library::EARLY.fetch_add(1, Ordering::Relaxed);
@@ -292,5 +303,17 @@ mod tests {
             std::thread::yield_now();
         }
         assert!(matches!(p.made.get(), Some(None)));
+    }
+
+    #[test]
+    fn a_pipeline_still_queued_at_first_use_is_remembered_for_prewarm() {
+        let shader = super::super::shader("compute", b"pending prewarm fixture");
+        let p = Arc::new(Pending::new(vec![shader], None));
+        // A worker has yet to reach this job when the request's wait ends.
+        p.queued.store(true, Ordering::Relaxed);
+        assert!(!super::super::library::wanted_early(&p.key));
+        assert!(ready(&p).is_none());
+        assert!(p.made.get().is_none());
+        assert!(super::super::library::wanted_early(&p.key));
     }
 }
