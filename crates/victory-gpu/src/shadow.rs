@@ -81,6 +81,35 @@ struct Snapshot {
     /// Sorted, disjoint ranges saved on first write declaration. Adjacent
     /// ranges stay separate so extending a snapshot never recopies old bytes.
     segments: Vec<(usize, Vec<u8>)>,
+    reconciled: Reconciled,
+}
+
+/// Parts of this submission that no longer need comparing. Keeping the
+/// gaps lets later declarations retry a readable part of a failed piece.
+#[derive(Default)]
+struct Reconciled(BTreeMap<usize, usize>);
+
+impl Reconciled {
+    fn next(&self, from: usize, to: usize) -> Option<(usize, usize)> {
+        let from = self.0.range(..=from).next_back().map_or(from, |(_, &end)| from.max(end));
+        if from >= to {
+            return None;
+        }
+        let end = self.0.range(from..to).next().map_or(to, |(&start, _)| start);
+        Some((from, end))
+    }
+
+    /// Records an uncovered range, joining any neighbors that touch it.
+    fn record(&mut self, from: usize, to: usize) {
+        let to = self.0.remove(&to).unwrap_or(to);
+        if let Some((_, end)) = self.0.range_mut(..from).next_back()
+            && *end == from
+        {
+            *end = to;
+        } else {
+            self.0.insert(from, to);
+        }
+    }
 }
 
 impl Snapshot {
@@ -129,17 +158,18 @@ impl Snapshot {
     }
 
     fn clear(&mut self) {
+        self.reconciled.0.clear();
         for (_, bytes) in self.segments.drain(..) {
             give_back(bytes);
         }
     }
 }
 
-/// Applies bytes changed by the GPU to the title snapshot and brings the
-/// host copy back in sync. Returns whether any title bytes need writing.
-fn merge_copy_back(title: &mut [u8], host: &mut [u8], before: &[u8]) -> bool {
+/// Applies bytes changed by the GPU to the title snapshot. Returns
+/// whether any title bytes need writing.
+fn merge_copy_back(title: &mut [u8], host: &[u8], before: &[u8]) -> bool {
     let (title_words, title_tail) = title.as_chunks_mut::<8>();
-    let (host_words, host_tail) = host.as_chunks_mut::<8>();
+    let (host_words, host_tail) = host.as_chunks::<8>();
     let (before_words, before_tail) = before.as_chunks::<8>();
     let mut changed = false;
     for ((title, host), &before) in title_words.iter_mut().zip(host_words).zip(before_words) {
@@ -156,14 +186,12 @@ fn merge_copy_back(title: &mut [u8], host: &mut [u8], before: &[u8]) -> bool {
         let merged = (host_word & mask) | (title_word & !mask);
         changed |= merged != title_word;
         *title = merged.to_ne_bytes();
-        *host = *title;
     }
     for ((title, host), &before) in title_tail.iter_mut().zip(host_tail).zip(before_tail) {
         if *host != before && *host != *title {
             *title = *host;
             changed = true;
         }
-        *host = *title;
     }
     changed
 }
@@ -285,28 +313,37 @@ impl Shadow {
             // By 64 KiB piece: the copy compared with its bytes before the
             // submission, title memory read only where the GPU wrote.
             const PIECE: usize = 64 << 10;
-            let mut title = vec![0u8; PIECE];
+            let mut title = Vec::new();
             let mut scratch = Vec::new();
             let mut synced = Vec::new();
-            let mut at = from;
-            while at < to {
-                let n = (PIECE - (start + at) % PIECE).min(to - at);
-                let Some(old) = snapshot.piece(at, at + n, &mut scratch) else {
+            let mut next = from;
+            while let Some((at, end)) = snapshot.reconciled.next(next, to) {
+                let n = (PIECE - (start + at) % PIECE).min(end - at);
+                next = at + n;
+                let Some(old) = snapshot.piece(at, next, &mut scratch) else {
                     break;
                 };
                 // SAFETY: inside the mapping; only the submitting thread
                 // writes it.
                 let host = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
-                let title = &mut title[..n];
-                if host != old && crate::host::read_into((start + at) as *const u8, title) {
-                    if merge_copy_back(title, host, old) {
+                if host != old {
+                    title.resize(n, 0);
+                    if !crate::host::read_into((start + at) as *const u8, &mut title) {
+                        continue;
+                    }
+                    if merge_copy_back(&mut title, host, old) {
                         crate::watch::writing(start + at, n);
-                        crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
+                        if !crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n) {
+                            continue;
+                        }
                         written += n;
                     }
-                    synced.push((start + at) / PAGE);
+                    host.copy_from_slice(&title);
+                    if n == PAGE {
+                        synced.push((start + at) / PAGE);
+                    }
                 }
-                at += n;
+                snapshot.reconciled.record(at, next);
             }
             // Pages made equal to title memory are current in the copy, so
             // our own write is not taken for the title's; others keep what
@@ -473,6 +510,65 @@ mod tests {
     }
 
     #[test]
+    fn redundant_writebacks_keep_later_cpu_stores() {
+        let host = super::host().expect("test requires a host D3D12 device");
+        let mut title = [11u8; 16];
+        let address = title.as_mut_ptr() as usize;
+        let (buffer, data) = host.shared_buffer(title.len() as u64).unwrap();
+        let shadow = super::Shadow::new(buffer, data, 0, address as u64, title.len() as u64, None);
+        // SAFETY: the live host mapping belongs to this fixture.
+        unsafe { data.write_bytes(11, title.len()) };
+        shadow.writing(address + 2, 4);
+        shadow.writing(address + 3, 5);
+        // SAFETY: the three offsets are within the host mapping.
+        unsafe {
+            *data.add(2) = 42;
+            *data.add(5) = 43;
+            *data.add(7) = 44;
+        }
+
+        title[4] = 31;
+        std::hint::black_box(&mut title);
+        assert_eq!(shadow.copy_back(address + 2, 4), 4);
+        assert_eq!(&title[2..8], &[42, 11, 31, 43, 11, 11]);
+        title[4] = 55;
+        title[5] = 56;
+        std::hint::black_box(&mut title);
+        let second = shadow.copy_back(address + 3, 5);
+        assert_eq!(&title[2..8], &[42, 11, 55, 56, 11, 44]);
+        assert_eq!(second, 2);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn smaller_writeback_retries_bytes_beyond_an_unreadable_page() {
+        use victory_loader::linux::vm;
+
+        let host = super::host().expect("test requires a host D3D12 device");
+        let address = vm::alloc(0, PAGE, vm::MEM_COMMIT, vm::PAGE_READWRITE, PAGE).unwrap();
+        let (buffer, data) = host.shared_buffer(PAGE as u64).unwrap();
+        let shadow = super::Shadow::new(buffer, data, 0, address as u64, PAGE as u64, None);
+        let tail = 8192;
+        // SAFETY: both mappings were just created and belong to this test.
+        unsafe {
+            (address as *mut u8).write_bytes(11, PAGE);
+            data.write_bytes(11, PAGE);
+        }
+        shadow.writing(address, PAGE);
+        shadow.writing(address + tail, 4);
+        // SAFETY: within the live host mapping.
+        unsafe { data.add(tail).write_bytes(42, 4) };
+        vm::protect(address + 4096, 4096, vm::PAGE_NOACCESS).unwrap();
+
+        let first = shadow.copy_back(address, PAGE);
+        let later = shadow.copy_back(address + tail, 4);
+        // SAFETY: the tested four bytes lie outside the inaccessible page.
+        let result = unsafe { ((address + tail) as *const [u8; 4]).read() };
+        vm::free(address, 0, vm::MEM_RELEASE).unwrap();
+        assert_eq!((first, later, result), (0, 4, [42; 4]));
+    }
+
+    #[test]
     fn word_merge_matches_byte_merge() {
         for len in (0..=40).chain([4097, 65536]) {
             let before: Vec<_> = (0..len + 1).map(|i| i as u8).collect();
@@ -493,10 +589,9 @@ mod tests {
                     .map(|((&old, &gpu), &cpu)| if gpu == old { cpu } else { gpu })
                     .collect();
                 let changed = expected != title;
-                assert_eq!(merge_copy_back(&mut title, &mut after, before), changed);
+                assert_eq!(merge_copy_back(&mut title, &after, before), changed);
                 assert_eq!(title, expected);
-                assert_eq!(after, expected);
-                assert!(!merge_copy_back(&mut title, &mut after, before));
+                assert!(!merge_copy_back(&mut title, &after, before));
             }
         }
     }
